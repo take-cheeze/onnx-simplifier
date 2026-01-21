@@ -86,9 +86,9 @@ jobs:
         # It's important to leave the project directory where a 'onnxsim' subdirectory exists
         cd dist
         python3 -m pip install onnxruntime ninja sccache
-        python3 -m pip install onnxsim-*.tar.gz
+        python3 -m pip install onnxsim2-*.tar.gz
         python3 -c "import onnxsim; print(dir(onnxsim))"
-        python3 -m pip uninstall -y onnxsim
+        python3 -m pip uninstall -y onnxsim2
         python3 -m pip install onnx_simplifier-*.tar.gz
         python3 -c "import onnxsim; print(dir(onnxsim))"
         python3 -m pip uninstall -y onnx-simplifier
