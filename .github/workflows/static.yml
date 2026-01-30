@@ -42,8 +42,8 @@ jobs:
       - name: Setup Pages
         uses: actions/configure-pages@v5
       - uses: mozilla-actions/sccache-action@v0.0.9
+      - run: pip install cmake
       - run: |
-          pip install cmake
           git clone --depth 1 https://github.com/emscripten-core/emsdk.git
           ./emsdk/emsdk install ${EMSCRIPTEN_VERSION}
           ./emsdk/emsdk activate ${EMSCRIPTEN_VERSION}
