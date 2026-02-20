@@ -42,7 +42,7 @@ if (ONNXSIM_BUILTIN_ORT)
 endif()
 
 # configure onnx-optimizer after onnxruntime, because they both depend on onnx and onnxruntime has its own flags for onnx
-add_subdirectory(third_party/onnx-optimizer)
+add_subdirectory(third_party/onnx-optimizer EXCLUDE_FROM_ALL)
 
 add_library(onnxsim onnxsim/onnxsim.cpp)
 if (ONNXSIM_BUILTIN_ORT)
@@ -70,10 +70,10 @@ if (EMSCRIPTEN)
 endif()
 
 if (ONNXSIM_PYTHON)
-  add_subdirectory(third_party/pybind11)
-  pybind11_add_module(onnxsim_cpp2py_export onnxsim/cpp2py_export.cc)
+  find_package(
+    Python 3.10
+    COMPONENTS Interpreter Development.Module REQUIRED
+    OPTIONAL_COMPONENTS Development.SABIModule)
+  nanobind_add_module(onnxsim_cpp2py_export onnxsim/cpp2py_export.cc STABLE_ABI)
   target_link_libraries(onnxsim_cpp2py_export PRIVATE onnxsim)
-  if(NOT "${PY_EXT_SUFFIX}" STREQUAL "")
-    set_target_properties(onnxsim_cpp2py_export PROPERTIES SUFFIX ${PY_EXT_SUFFIX})
-  endif()
 endif()
