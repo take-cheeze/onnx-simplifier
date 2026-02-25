@@ -61,7 +61,7 @@ except (OSError, subprocess.CalledProcessError):
     dev_count = None
 
 if os.getenv('ONNXSIM_RELEASE') is not None:
-    version = '0.0.0'
+    version = os.getenv('ONNXSIM_RELEASE')
     git_version = None
     dev_count = None
 
