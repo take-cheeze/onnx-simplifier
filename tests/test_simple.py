@@ -38,7 +38,9 @@ def test_mg():
     x = torch.randn([1, 256, 160, 184])
     b = torch.randn([100, 256, 1, 1])
     opt = export_simplify_and_check_by_python_api(MG(), (x, b))
-    onnxruntime.InferenceSession(opt.SerializeToString())
+    sess = onnxruntime.InferenceSession(opt.SerializeToString(), providers=["CPUExecutionProvider"])
+    outs = [i.name for i in sess.get_outputs()]
+    sess.run(outs, { opt.graph.input[0].name: x.numpy(), opt.graph.input[1].name: b.numpy() })
 
 
 def test_transformer():
