@@ -1,5 +1,6 @@
 import torch
 import onnx
+import onnxruntime
 import onnxsim
 
 from onnxsim.test_utils import export_simplify_and_check_by_python_api
@@ -36,7 +37,8 @@ def test_mg():
 
     x = torch.randn([1, 256, 160, 184])
     b = torch.randn([100, 256, 1, 1])
-    export_simplify_and_check_by_python_api(MG(), (x, b))
+    opt = export_simplify_and_check_by_python_api(MG(), (x, b))
+    onnxruntime.InferenceSession(opt.SerializeToString())
 
 
 def test_transformer():
