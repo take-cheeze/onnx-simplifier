@@ -26,7 +26,7 @@ def test_mg():
         def forward(self, x, b):
             x = x.float()
             b = b.float()
-            sh = torch.tensor(x.shape)
+            sh = x.shape
             x = x.view(sh[0], sh[1], -1)
             b = b.squeeze(-1)
             b = b.squeeze(-1)
@@ -54,4 +54,4 @@ def test_transformer():
         torch.rand((100, 2, 256), dtype=torch.float32),
         torch.rand((15, 2, 256), dtype=torch.float32),
     )
-    export_simplify_and_check_by_python_api(model, inputs, export_kwargs={"opset_version": 11})
+    export_simplify_and_check_by_python_api(model, inputs, export_kwargs={"dynamo": True})
