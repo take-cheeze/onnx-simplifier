@@ -16,6 +16,7 @@ def test_onnx_simplifier():
 
     export_simplify_and_check_by_python_api(MockModel(), torch.randn(1, 10))
 
+
 def test_mg():
     class MG(torch.nn.Module):
 
@@ -36,3 +37,21 @@ def test_mg():
     x = torch.randn([1, 256, 160, 184])
     b = torch.randn([100, 256, 1, 1])
     export_simplify_and_check_by_python_api(MG(), (x, b))
+
+
+def test_transformer():
+    model = torch.nn.Transformer(
+        d_model=256,
+        nhead=8,
+        num_encoder_layers=3,
+        num_decoder_layers=3,
+        dim_feedforward=1024,
+        dropout=0.1)
+    model.to('cpu').to(torch.float32)
+    model.eval()
+
+    inputs = (
+        torch.rand((100, 2, 256), dtype=torch.float32),
+        torch.rand((15, 2, 256), dtype=torch.float32),
+    )
+    export_simplify_and_check_by_python_api(model, inputs, export_kwargs={"opset_version": 11})
