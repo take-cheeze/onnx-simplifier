@@ -41,7 +41,9 @@ jobs:
       - name: Setup Pages
         uses: actions/configure-pages@v5
       - run: pip install cmake ninja
-      - run: sudo apt install protobuf-compiler
+      - run: |
+          sudo apt update
+          sudo apt install protobuf-compiler
       - name: Prepare ccache timestamp
         id: ccache_cache_timestamp
         run: |
