@@ -2,7 +2,7 @@ import torch
 import onnx
 import onnxsim
 
-from onnxsim.tests.test_python_api import export_simplify_and_check_by_python_api
+from onnxsim.test_utils import export_simplify_and_check_by_python_api
 
 
 def test_onnx_simplifier():
