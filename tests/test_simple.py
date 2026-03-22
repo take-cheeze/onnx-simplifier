@@ -105,3 +105,14 @@ def test_upsample():
             u_info = v
     assert u_info is not None
     assert [i.dim_value for i in v.type.tensor_type.shape.dim] == [1, 3, 96, 96]
+
+
+def test_concat_squeese():
+    # test for https://github.com/onnxsim/onnxsim/issues/46
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            # return torch.cat((torch.mean(x, 1, keepdim=True), torch.mean(x, 1, keepdim=True)), dim=1)
+            return torch.cat((torch.mean(x, 1).unsqueeze(1), torch.mean(x, 1).unsqueeze(1)), dim=1)
+
+    export_simplify_and_check_by_python_api(Model(), (torch.rand(20, 20),), export_kwargs={"opset_version": 9})
+
