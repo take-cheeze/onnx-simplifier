@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "onnxsim"
+dynamic = ["version"]
+description = "Simplify your ONNX model"
+readme = "README.md"
+license = {text = "MIT AND (Apache-2.0 OR BSD-2-Clause)"}
+requires-python = ">=3.10"
+dependencies = [
+    "onnx",
+    "rich",
+]
+authors = [
+    {name = "ONNX Simplifier Authors", email = "daquexian566@gmail.com"},
+]
+keywords = ["deep-learning", "ONNX"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development",
+]
+
+[project.urls]
+Homepage = "https://github.com/daquexian/onnx-simplifier"
+
+[project.scripts]
+onnxsim = "onnxsim:main"

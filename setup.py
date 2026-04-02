@@ -1,4 +1,4 @@
-from distutils import sysconfig, log
+import sysconfig
 import setuptools
 import setuptools.command.build_py
 import setuptools.command.develop
@@ -6,13 +6,11 @@ import setuptools.command.build_ext
 
 from collections import namedtuple
 from contextlib import contextmanager
-import glob
 import os
 import shlex
 import subprocess
 import shutil
 import sys
-import platform
 from textwrap import dedent
 import multiprocessing
 import re
@@ -26,9 +24,6 @@ WINDOWS = (os.name == 'nt')
 MACOS = sys.platform.startswith("darwin")
 
 CMAKE = shutil.which('cmake')
-
-install_requires = []
-setup_requires = []
 
 USE_MSVC_STATIC_RUNTIME = bool(os.getenv('USE_MSVC_STATIC_RUNTIME', '0') == '1')
 ONNX_ML = not bool(os.getenv('ONNX_ML') == '0')
@@ -144,7 +139,7 @@ class cmake_build(setuptools.Command):
             # configure
             cmake_args = [
                 CMAKE,
-                '-DPython_INCLUDE_DIR={}'.format(sysconfig.get_python_inc()),
+                '-DPython_INCLUDE_DIR={}'.format(sysconfig.get_path('include')),
                 '-DPython_EXECUTABLE={}'.format(sys.executable),
                 '-DONNX_BUILD_PYTHON=ON',
                 '-DONNXSIM_PYTHON=ON',
@@ -187,7 +182,7 @@ class cmake_build(setuptools.Command):
                 extra_cmake_args = shlex.split(os.environ['CMAKE_ARGS'])
                 # prevent crossfire with downstream scripts
                 del os.environ['CMAKE_ARGS']
-                log.info('Extra cmake args: {}'.format(extra_cmake_args))
+                print('Extra cmake args: {}'.format(extra_cmake_args))
                 cmake_args.extend(extra_cmake_args)
             cmake_args.append(TOP_DIR)
             print(f"Run command {cmake_args}")
@@ -261,26 +256,7 @@ ext_modules = [
         py_limited_api=py_limited_api)
 ]
 
-# no need to do fancy stuff so far
 packages = setuptools.find_packages()
-
-# Though we depend on onnxruntime, it has three different packages:
-# onnxruntime, onnxruntime-gpu and onnxruntime-noopenmp.
-# The solution is, we publish two packages, a wheel named onnxsim-no-ort
-# and a sdist package named onnxsim, onnxsim depends on onnxsim-no-ort,
-# and also check if one of onnxruntime packages is installed, and depends
-# on onnxruntime when no existing installed packages.
-install_requires.extend([
-    'onnx',
-    'rich',
-])
-
-setup_requires.append('pytest-runner')
-
-# read the contents of your README file
-from pathlib import Path
-this_directory = Path(__file__).parent
-long_description = (this_directory / "README.md").read_text()
 
 version_str = VersionInfo.version
 
@@ -292,39 +268,10 @@ if VersionInfo.dev_count is not None:
 #     version_str += f"+{VersionInfo.git_version}"
 
 setuptools.setup(
-    name="onnxsim",
     version=version_str,
-    description='Simplify your ONNX model',
     ext_modules=ext_modules,
     cmdclass=cmdclass,
     packages=packages,
-    license='MIT AND (Apache-2.0 OR BSD-2-Clause)',
     include_package_data=True,
-    install_requires=install_requires,
-    setup_requires=setup_requires,
-    author='ONNX Simplifier Authors',
-    author_email='daquexian566@gmail.com',
-    url='https://github.com/daquexian/onnx-simplifier',
-    keywords='deep-learning ONNX',
-    long_description=long_description,
-    long_description_content_type='text/markdown',
-    classifiers=[
-        'Development Status :: 4 - Beta',
-        'Intended Audience :: Developers',
-        'Programming Language :: Python :: 3 :: Only',
-        'Programming Language :: Python :: 3.7',
-        'Programming Language :: Python :: 3.8',
-        'Programming Language :: Python :: 3.9',
-        'Programming Language :: Python :: 3.10',
-        'Programming Language :: Python :: 3.11',
-        'Topic :: Scientific/Engineering',
-        'Topic :: Software Development'
-    ],
-    python_requires='>=3.7',
-    entry_points={
-        'console_scripts': [
-            'onnxsim=onnxsim:main',
-        ],
-    },
     options=setup_opts,
 )
