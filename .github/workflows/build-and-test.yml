@@ -32,7 +32,7 @@ jobs:
         os: [ubuntu-24.04, ubuntu-24.04-arm, windows-2025, macos-15]
         py_ver: [cp310, cp312, cp313]
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
       with:
         submodules: recursive
         fetch-depth: 0
@@ -48,7 +48,7 @@ jobs:
         arch: amd64
       if: ${{ matrix.os == 'windows-2025' }}
     - name: Build onnxsim wheels
-      uses: pypa/cibuildwheel@v3.3.1
+      uses: pypa/cibuildwheel@v3.4.1
       env:
         CIBW_BUILD: "${{ matrix.py_ver }}-*"
     - name: Check ABI3
@@ -56,7 +56,7 @@ jobs:
         pip install abi3audit
         abi3audit --strict -v --report ./wheelhouse/*.whl
       if: ${{ contains(fromJSON('["cp312", "cp313"]'), matrix.py_ver) }}
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v7
       with:
         name: python-dist-${{ matrix.os }}-${{ matrix.py_ver }}
         path: ./wheelhouse/*.whl
@@ -69,7 +69,7 @@ jobs:
       CMAKE_GENERATOR: Ninja
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
       with:
         submodules: recursive
         fetch-depth: 0
@@ -102,7 +102,7 @@ jobs:
         # Disable publish of alias package
         rm onnx_simplifier-*.tar.gz
 
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v7
       with:
         name: python-dist-sdist
         path: dist/*.tar.gz
@@ -118,7 +118,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-    - uses: actions/download-artifact@v4
+    - uses: actions/download-artifact@v8
       with:
         # unpacks python-dist artifact into dist/
         # if `name: python-dist` is omitted, the action will create extra parent dir
