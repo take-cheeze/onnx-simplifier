@@ -204,6 +204,8 @@ def simplify(
 
     try:
         model_bytes = model.SerializeToString()
+        if len(model_bytes) >= 2 * 1024 * 1024 * 1024:
+            raise EncodeError("Message larger than 2GiB")
         model_opt_bytes = C.simplify(
             model_bytes,
             skipped_optimizers,

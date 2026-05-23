@@ -153,3 +153,21 @@ def test_optional_type():
         inputs,
         simplify_kwargs={"input_data": {"i": inputs[0].numpy()}},
         export_kwargs={"opset_version": 15, "input_names": ["i"]})
+
+
+def test_ext():
+    class MyMod(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+
+            self.param = torch.nn.Parameter(torch.rand(1024, 1024, 1024, dtype=torch.float32))
+
+        def forward(self, x):
+            return self.param * x
+
+    module = MyMod()
+    inputs = (torch.tensor(1),)
+    export_simplify_and_check_by_python_api(
+        module,
+        inputs,
+        export_kwargs={"input_names": ["x"]})
