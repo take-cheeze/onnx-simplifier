@@ -28,7 +28,7 @@ jobs:
         python-version: '3.14'
     - uses: mozilla-actions/sccache-action@v0.0.10
 
-    - run: pip install sccache
+    - run: pip install cmake ninja setuptools sccache
 
     - name: Build
       run: pip install --no-build-isolation -ve .
