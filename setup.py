@@ -138,13 +138,16 @@ class cmake_build(setuptools.Command):
             os.makedirs(CMAKE_BUILD_DIR)
 
         with cd(CMAKE_BUILD_DIR):
-            build_type = 'Release'
+            build_type = 'RelWithDebInfo'
+            if WINDOWS:
+                build_type = 'Release'
             # configure
             cmake_args = [
                 CMAKE,
                 '-DPython_INCLUDE_DIR={}'.format(sysconfig.get_path('include')),
                 '-DPython_EXECUTABLE={}'.format(sys.executable),
                 '-DONNX_BUILD_PYTHON=ON',
+                "-DONNX_INSTALL=OFF",
                 '-DONNXSIM_PYTHON=ON',
                 '-DONNXSIM_BUILTIN_ORT=OFF',
                 '-DONNX_USE_LITE_PROTO=OFF',

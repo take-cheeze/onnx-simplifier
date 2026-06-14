@@ -1,0 +1,46 @@
+name: Build and Test with address sanitizer
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build_sdist:
+    name: Build and test
+    runs-on: ubuntu-latest
+    env:
+      CMAKE_GENERATOR: Ninja
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      CMAKE_LINKER_TYPE: MOLD
+      CXXFLAGS: -fsanitize=address
+      LDFLAGS: -fsanitize=address
+      ASAN_OPTIONS: verify_asan_link_order=0
+      SCCACHE_GHA_ENABLED: on
+      ACTIONS_CACHE_SERVICE_V2: on
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.14'
+    - uses: mozilla-actions/sccache-action@v0.0.10
+
+    - run: pip install cmake ninja setuptools sccache
+
+    - name: Build
+      run: pip install --no-build-isolation -ve .
+    
+    - name: Install test dependencies
+      run: |
+        pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
+        pip install pytest flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26
+    - name: Test
+      run: |
+        LD_PRELOAD="/lib/x86_64-linux-gnu/libasan.so.8 /usr/lib/x86_64-linux-gnu/libstdc++.so.6" \
+        LSAN_OPTIONS=suppressions=./scripts/leak.txt \
+        pytest -sv tests
