@@ -362,3 +362,57 @@ def test_perform_optimization_false():
     simple_model, _ = onnxsim.simplify(onnx_model, perform_optimization=False, skip_shape_inference=True)
     assert simple_model is not None
 
+
+
+def test_preserve_doc_strings():
+    # Regression test for https://github.com/onnxsim/onnxsim/issues/428
+    # doc_strings must survive simplification.
+    input_tensor = onnx.helper.make_tensor_value_info(
+        "input", onnx.TensorProto.FLOAT, [1, 3, 224, 224])
+    input_tensor.doc_string = "Input documentation"
+    output_tensor = onnx.helper.make_tensor_value_info(
+        "output", onnx.TensorProto.FLOAT, [1, 3, 224, 224])
+    output_tensor.doc_string = "Output documentation"
+
+    node = onnx.helper.make_node("Identity", inputs=["input"], outputs=["output"])
+    graph = onnx.helper.make_graph([node], "test", [input_tensor], [output_tensor])
+    graph.doc_string = "Graph documentation"
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 16)])
+    model.ir_version = 8
+    model.doc_string = "Model documentation"
+
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    assert sim_model.graph.input[0].doc_string == "Input documentation"
+    assert sim_model.graph.output[0].doc_string == "Output documentation"
+    assert sim_model.graph.doc_string == "Graph documentation"
+    assert sim_model.doc_string == "Model documentation"
+
+
+def test_preserve_node_doc_strings():
+    # Regression test for https://github.com/onnxsim/onnxsim/issues/428
+    # A node that survives simplification must keep its doc_string.
+    input_tensor = onnx.helper.make_tensor_value_info(
+        "input", onnx.TensorProto.FLOAT, [1, 3, 4, 4])
+    output_tensor = onnx.helper.make_tensor_value_info(
+        "output", onnx.TensorProto.FLOAT, [1, 3, 4, 4])
+
+    relu = onnx.helper.make_node(
+        "Relu", inputs=["input"], outputs=["h"], name="relu")
+    relu.doc_string = "Relu documentation"
+    sigmoid = onnx.helper.make_node(
+        "Sigmoid", inputs=["h"], outputs=["output"], name="sigmoid")
+    sigmoid.doc_string = "Sigmoid documentation"
+
+    graph = onnx.helper.make_graph(
+        [relu, sigmoid], "test", [input_tensor], [output_tensor])
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 16)])
+    model.ir_version = 8
+
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    docs = {n.name: n.doc_string for n in sim_model.graph.node}
+    assert docs["relu"] == "Relu documentation"
+    assert docs["sigmoid"] == "Sigmoid documentation"
