@@ -559,6 +559,48 @@ def test_unknown_contrib_op_is_tolerated():
     assert _value_info_shape(sim_model, "C") == [1, 3, 16, 16]
 
 
+def test_run_coerces_non_ndarray_output():
+    # Regression test for GitHub PR #249. When the inference backend returns a
+    # non-ndarray value for an output -- for example onnxruntime yields an empty
+    # Python list for an empty sequence output -- the executor used to crash
+    # inside onnx.numpy_helper.from_array with
+    #     AttributeError: 'list' object has no attribute 'shape'
+    # The executor must coerce such a value into an (empty) numpy array so the
+    # serialization keeps working.
+    from collections import OrderedDict
+    from onnxsim import onnx_simplifier
+
+    node = onnx.helper.make_node("Relu", ["x"], ["y"])
+    x = onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1])
+    y = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1])
+    graph = onnx.helper.make_graph([node], "g", [x], [y])
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+    )
+
+    executor = onnx_simplifier.PyModelExecutor()
+
+    # Simulate the backend returning an empty list instead of a numpy array.
+    original_run_model = onnx_simplifier.backend.run_model
+    onnx_simplifier.backend.run_model = lambda *a, **k: OrderedDict([("y", [])])
+    try:
+        input_tensor = onnx.numpy_helper.from_array(
+            np.zeros((1,), dtype=np.float32), "x"
+        )
+        outputs = executor.Run(
+            model.SerializeToString(), [input_tensor.SerializeToString()]
+        )
+    finally:
+        onnx_simplifier.backend.run_model = original_run_model
+
+    assert len(outputs) == 1
+    result_tp = onnx.TensorProto()
+    result_tp.ParseFromString(outputs[0])
+    result = onnx.numpy_helper.to_array(result_tp)
+    assert isinstance(result, np.ndarray)
+    assert result.size == 0
+
+
 def test_perform_optimization_false():
     def _create_dummy_model():
         class MockModel(torch.nn.Module):
