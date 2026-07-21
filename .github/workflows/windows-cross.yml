@@ -87,14 +87,20 @@ jobs:
           echo "installing ${whl}"
           python -m pip install "${whl}"
 
+      # Run from a neutral directory: the repo root contains an ./onnxsim source
+      # package (without the compiled .pyd) that would otherwise shadow the
+      # pip-installed wheel. cibuildwheel does the same by running tests from an
+      # isolated dir with an absolute {project}/tests path.
       - name: Verify the wheel is really the cross-built one
         shell: bash
+        working-directory: ${{ runner.temp }}
         run: |
           python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print('onnxsim', onnxsim.__version__); print(m.__file__)"
 
       - name: Run tests
         shell: bash
+        working-directory: ${{ runner.temp }}
         run: |
-          pytest -v tests
+          pytest -v "${GITHUB_WORKSPACE}/tests"
           onnxsim -h
           onnxsim --list-default-optimizers
