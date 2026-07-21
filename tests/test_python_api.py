@@ -136,8 +136,8 @@ def test_dynamic_axes_preserve_dynamic_dimension():
     # rather than hardcoding the dummy value of 2.
     in_dim0 = sim_model.graph.input[0].type.tensor_type.shape.dim[0]
     out_dim0 = sim_model.graph.output[0].type.tensor_type.shape.dim[0]
-    assert in_dim0.dim_value == 0 and in_dim0.dim_param != ""
-    assert out_dim0.dim_value == 0 and out_dim0.dim_param != ""
+    assert in_dim0.dim_value == 0 and in_dim0.dim_param == "batch"
+    assert out_dim0.dim_value == 0 and out_dim0.dim_param == "batch"
 
     # And it must actually run for a batch size other than the export dummy of
     # 2. If the shape computation had been folded to a constant, this would
