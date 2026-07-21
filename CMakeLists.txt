@@ -17,6 +17,7 @@ set(CMAKE_CXX_STANDARD 20)
 option(ONNXSIM_PYTHON "" OFF)
 option(ONNXSIM_BUILTIN_ORT "" ON)
 option(ONNXSIM_WASM_NODE "For node (enable NODERAWFS etc.)" OFF)
+option(ONNXSIM_C_API "Build the C ABI shared library used by the Rust wrapper and other FFI consumers" OFF)
 
 if (ONNXSIM_PYTHON AND EMSCRIPTEN)
   message(STATUS "python and emscripten cannot be built at the same time")
@@ -77,6 +78,19 @@ if (EMSCRIPTEN)
   target_link_libraries(onnxsim_bin embind "-Wl,--whole-archive" onnxsim "-Wl,--no-whole-archive")
 else()
   target_link_libraries(onnxsim_bin onnxsim)
+endif()
+
+if (ONNXSIM_C_API)
+  if (NOT ONNXSIM_BUILTIN_ORT)
+    message(FATAL_ERROR "ONNXSIM_C_API requires ONNXSIM_BUILTIN_ORT=ON")
+  endif()
+  add_library(onnxsim_c SHARED onnxsim/capi/onnxsim_c_api.cpp)
+  target_link_libraries(onnxsim_c PRIVATE onnxsim onnx_optimizer onnx)
+  target_include_directories(onnxsim_c PUBLIC onnxsim/capi)
+  # The exported symbols opt back into default visibility via ONNXSIM_C_API in
+  # the header, so the project-wide "hidden" preset keeps everything else local.
+  set_target_properties(onnxsim_c PROPERTIES C_VISIBILITY_PRESET hidden
+                                             CXX_VISIBILITY_PRESET hidden)
 endif()
 
 if (ONNXSIM_PYTHON)

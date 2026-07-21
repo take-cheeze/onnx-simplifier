@@ -1,0 +1,56 @@
+name: Rust wrapper
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: rust
+
+jobs:
+  # Fast checks that do not require building the native ONNX Runtime stack.
+  # These only type-check/lint (no linking), so the native library is not needed.
+  lint:
+    name: fmt / clippy (no native build)
+    runs-on: ubuntu-latest
+    env:
+      ONNXSIM_NO_BUILD: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Full build that compiles the C API and links it against onnxsim.
+  build:
+    name: build + smoke test (native)
+    runs-on: ubuntu-latest
+    env:
+      CMAKE_GENERATOR: Ninja
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Build the workspace (compiles and links the native library)
+        run: cargo build --release --workspace
+      - name: Run tests (unit + linked integration tests)
+        run: |
+          cargo test --release --workspace
+          cargo test --release -- --ignored list_optimizers_is_non_empty

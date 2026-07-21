@@ -133,3 +133,7 @@ test*.py
 
 .setuptools-cmake-build/
 onnxsim/version.py
+
+# Rust
+/rust/target/
+rust/Cargo.lock

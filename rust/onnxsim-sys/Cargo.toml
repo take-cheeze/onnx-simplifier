@@ -1,0 +1,20 @@
+[package]
+name = "onnxsim-sys"
+description = "Low-level FFI bindings to the ONNX Simplifier (onnxsim) C API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+links = "onnxsim_c"
+build = "build.rs"
+categories = ["external-ffi-bindings", "science"]
+keywords = ["onnx", "onnxsim", "ffi", "machine-learning"]
+
+[build-dependencies]
+cmake = "0.1"
+
+[lib]
+doctest = false
