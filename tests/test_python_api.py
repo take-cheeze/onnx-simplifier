@@ -580,7 +580,7 @@ def test_run_coerces_non_ndarray_output():
     )
     graph = onnx.helper.make_graph([node], "g", [], [seq_out])
     model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+        graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=10
     )
 
     # Drive the executor with the real backend: SequenceEmpty yields an empty
@@ -593,7 +593,6 @@ def test_run_coerces_non_ndarray_output():
 
     sim_model, check_ok = onnxsim.simplify(model)
     assert check_ok
-    print(sim_model)
 
 
 def test_perform_optimization_false():
