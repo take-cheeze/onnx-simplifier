@@ -91,6 +91,17 @@ if (ONNXSIM_C_API)
   if (NOT ONNXSIM_BUILTIN_ORT)
     message(FATAL_ERROR "ONNXSIM_C_API requires ONNXSIM_BUILTIN_ORT=ON")
   endif()
+  # In the builtin-ORT path onnx_optimizer is built as a shared library
+  # (build_ort.cmake sets BUILD_SHARED_LIBS ON), but it inherits the
+  # project-wide "hidden" visibility preset, so it exports none of its symbols.
+  # onnxsim/onnxsim_c call into it across the shared-library boundary (e.g.
+  # OptimizeFixed, GetFuseAndEliminationPass), which then fail to resolve at
+  # runtime with "undefined symbol". Restore default visibility so those symbols
+  # are exported. (The Python build avoids this by linking it statically.)
+  if (TARGET onnx_optimizer)
+    set_target_properties(onnx_optimizer PROPERTIES CXX_VISIBILITY_PRESET default
+                                                    VISIBILITY_INLINES_HIDDEN FALSE)
+  endif()
   add_library(onnxsim_c SHARED onnxsim/capi/onnxsim_c_api.cpp)
   target_link_libraries(onnxsim_c PRIVATE onnxsim onnx_optimizer onnx)
   target_include_directories(onnxsim_c PUBLIC onnxsim/capi)
