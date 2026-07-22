@@ -279,6 +279,44 @@ def test_unfoldable_const_node_keeps_topological_order():
     assert op_types.index("SequenceEmpty") < op_types.index("SequenceInsert")
 
 
+def test_folding_does_not_duplicate_initializers():
+    # Folding a const op that reads a weight (here a Transpose on an initializer)
+    # produces a new initializer for the result but must not leave the original
+    # operand initializer dangling in the graph. Otherwise the weight data is
+    # duplicated, which can push a large model past onnx's 2GB protobuf limit
+    # before the optimizer runs (issue #174).
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [3, 4])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [3, 4])
+    w = helper.make_tensor("w", TensorProto.FLOAT, [4, 3], list(range(12)))
+    nodes = [
+        helper.make_node("Transpose", ["w"], ["wt"], perm=[1, 0]),
+        helper.make_node("Add", ["x", "wt"], ["y"]),
+    ]
+    graph = helper.make_graph(nodes, "g", [x], [y], initializer=[w])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    onnx.checker.check_model(model)
+
+    # Disable the onnx optimizer so the constant folding logic alone is
+    # responsible for cleaning up the dangling initializer.
+    sim_model, check_ok = onnxsim.simplify(model, perform_optimization=False)
+    assert check_ok
+    onnx.checker.check_model(sim_model)
+
+    # Core invariant of the fix, independent of platform: the simplified graph
+    # must never carry an initializer that no node consumes. Whether the backend
+    # executor is able to fold the Transpose can vary between environments, but
+    # the "no dangling initializer" property must hold either way.
+    op_types = [n.op_type for n in sim_model.graph.node]
+    used = {i for n in sim_model.graph.node for i in n.input}
+    for init in sim_model.graph.initializer:
+        assert init.name in used, f"unused initializer left behind: {init.name}"
+
+    # When the Transpose was actually folded into an initializer, the folded
+    # result must replace the original weight "w" rather than duplicate it.
+    if "Transpose" not in op_types:
+        assert "w" not in {init.name for init in sim_model.graph.initializer}
+
+
 def test_fp8_qdq_model():
     # Regression test for GitHub issue #348. NVIDIA ModelOpt emits fp8 QDQ
     # models whose QuantizeLinear/DequantizeLinear zero points use the

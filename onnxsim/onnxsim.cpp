@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <fstream>
 #include <numeric>
+#include <set>
+#include <string>
 #include <unordered_map>
 
 #ifndef NO_BUILTIN_ORT
@@ -435,6 +437,65 @@ GetConstantNodes(const onnx::ModelProto& model) {
   return {const_nodes, non_const_nodes};
 }
 
+// Recursively collect the names of every tensor consumed as a node input,
+// descending into subgraphs (e.g. the branches of "If" or the body of "Loop").
+// Because ONNX subgraphs can reference tensors from the enclosing scope, an
+// initializer in the main graph may be used only by a node inside a subgraph.
+// Collecting names recursively ensures such initializers are not mistaken for
+// unused ones (issue #174).
+void CollectUsedTensorNames(const onnx::GraphProto& graph,
+                            std::set<std::string>& used) {
+  for (const auto& node : graph.node()) {
+    for (const auto& input : node.input()) {
+      if (!input.empty()) {
+        used.insert(input);
+      }
+    }
+    for (const auto& attr : node.attribute()) {
+      if (attr.has_g()) {
+        CollectUsedTensorNames(attr.g(), used);
+      }
+      for (const auto& subgraph : attr.graphs()) {
+        CollectUsedTensorNames(subgraph, used);
+      }
+    }
+  }
+  // Graph outputs must be kept even if no node consumes them.
+  for (const auto& output : graph.output()) {
+    used.insert(output.name());
+  }
+}
+
+// Remove initializers of the main graph that are no longer referenced by any
+// node (including nodes in subgraphs). Constant folding replaces a subgraph of
+// const ops (e.g. a Transpose on a weight) with a freshly computed initializer,
+// but leaves the original operand initializers in place. Without cleanup those
+// dangling weights are duplicated in the graph, which can push the model past
+// the 2GB protobuf limit before the onnx optimizer gets a chance to remove
+// them (issue #174).
+onnx::ModelProto EliminateUnusedInitializer(const onnx::ModelProto& model) {
+  onnx::ModelProto result;
+  result.CopyFrom(model);
+
+  std::set<std::string> used;
+  CollectUsedTensorNames(result.graph(), used);
+  // Keep initializers that double as graph inputs (their default value);
+  // dropping them would silently turn them into required inputs.
+  for (const auto& input : result.graph().input()) {
+    used.insert(input.name());
+  }
+
+  google::protobuf::RepeatedPtrField<onnx::TensorProto> kept;
+  for (auto& initializer : *result.mutable_graph()->mutable_initializer()) {
+    if (used.count(initializer.name()) > 0) {
+      *kept.Add() = std::move(initializer);
+    }
+  }
+  result.mutable_graph()->mutable_initializer()->Swap(&kept);
+
+  return result;
+}
+
 // Takes the model by value so a caller that no longer needs its copy can move
 // it in; ``onnx::shape_inference::InferShapes`` then mutates it in place, so no
 // extra ModelProto copy is made (the previous ``const&`` signature forced a
@@ -667,7 +728,9 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
         *model.mutable_graph()->add_node() = std::move(node);
       }
     }
-    return model;
+    // Drop initializers left dangling by folding so the intermediate model does
+    // not balloon in size (issue #174).
+    return EliminateUnusedInitializer(model);
   }
 }
 
@@ -772,6 +835,88 @@ std::function<T(T)> FixedPointFn(const std::function<T(T)>& f1,
 // through without copying when the caller passes an rvalue.
 onnx::ModelProto Identity(onnx::ModelProto model) { return model; }
 
+// Recursively collect the op types of operators that live in ONNX's *default*
+// domain but have no registered schema. These are custom operators -- most
+// commonly TensorRT plugins such as ``BatchedNMS_TRT`` or ``EfficientNMS_TRT``
+// -- that were exported into the default domain instead of a vendor-specific
+// one.
+//
+// Custom ops that already live in a non-default domain (e.g. ``com.microsoft``
+// or ``TRT``) are intentionally ignored: onnx::checker::check_model already
+// tolerates unknown ops in non-standard domains, which is exactly the manual
+// workaround reported in GitHub issue #220.
+void CollectCustomDefaultDomainOps(const onnx::GraphProto& graph,
+                                   int default_opset_version,
+                                   std::set<std::string>& custom_ops) {
+  for (const auto& node : graph.node()) {
+    const std::string& domain = node.domain();
+    const bool is_default_domain = domain.empty() || domain == "ai.onnx";
+    if (is_default_domain &&
+        onnx::OpSchemaRegistry::Schema(node.op_type(), default_opset_version,
+                                       /*domain=*/"") == nullptr) {
+      custom_ops.insert(node.op_type());
+    }
+    // Recurse into subgraphs held in node attributes (If/Loop/Scan bodies).
+    for (const auto& attr : node.attribute()) {
+      if (attr.has_g()) {
+        CollectCustomDefaultDomainOps(attr.g(), default_opset_version, custom_ops);
+      }
+      for (const auto& subgraph : attr.graphs()) {
+        CollectCustomDefaultDomainOps(subgraph, default_opset_version, custom_ops);
+      }
+    }
+  }
+}
+
+// Register a permissive placeholder schema for every default-domain custom op
+// found in ``model``. Without a schema, onnx::checker::check_model rejects the
+// model with "No Op registered for <op> with domain_version of <n>" and
+// simplification never even starts (GitHub issues #107 and #220). The
+// placeholder accepts any number of inputs/outputs of any tensor type and any
+// attributes, so the checker passes and the op is preserved untouched through
+// simplification. It carries no shape/type inference function, so shape
+// inference simply flows past the op as before.
+void RegisterCustomDefaultDomainOpSchemas(const onnx::ModelProto& model) {
+  int default_opset_version = 1;
+  for (const auto& opset : model.opset_import()) {
+    if (opset.domain().empty() || opset.domain() == "ai.onnx") {
+      default_opset_version =
+          std::max(default_opset_version, static_cast<int>(opset.version()));
+    }
+  }
+
+  std::set<std::string> custom_ops;
+  CollectCustomDefaultDomainOps(model.graph(), default_opset_version, custom_ops);
+
+  for (const auto& op_type : custom_ops) {
+    onnx::OpSchema schema;
+    schema.SetName(op_type)
+        .SetDomain("")
+        .SinceVersion(1)
+        .SetDoc(
+            "Placeholder schema registered by onnxsim for a custom operator "
+            "(e.g. a TensorRT plugin) exported into the default ONNX domain, so "
+            "that the model passes validation and is simplified with the "
+            "operator preserved unchanged.")
+        .Input(0, "inputs", "Variadic inputs of the custom operator.", "T",
+               onnx::OpSchema::Variadic, /*is_homogeneous=*/false,
+               /*min_arity=*/0)
+        .Output(0, "outputs", "Variadic outputs of the custom operator.", "T",
+                onnx::OpSchema::Variadic, /*is_homogeneous=*/false,
+                /*min_arity=*/0)
+        .TypeConstraint("T", onnx::OpSchema::all_tensor_types(),
+                        "Allow inputs and outputs of any tensor type.")
+        // Custom ops carry arbitrary, plugin-specific attributes; accept them
+        // all rather than trying to enumerate them.
+        .AllowUncheckedAttributes();
+    // Never fail or throw: a duplicate registration (e.g. simplifying two models
+    // that use the same custom op in one process) is a harmless no-op.
+    onnx::RegisterSchema(std::move(schema), /*opset_version_to_load=*/1,
+                         /*fail_duplicate_schema=*/false,
+                         /*fail_with_exception=*/false);
+  }
+}
+
 void Check(const onnx::ModelProto& model) { onnx::checker::check_model(model); }
 
 onnx::ModelProto Simplify(
@@ -781,6 +926,10 @@ onnx::ModelProto Simplify(
   // Make shape inference aware of ONNX Runtime's quantized contrib operators
   // (QLinearAdd and friends) so shape deduction does not stop at them.
   onnxsim::RegisterContribOpSchemas();
+  // Register permissive placeholder schemas for custom ops exported into the
+  // default ONNX domain (e.g. TensorRT plugins such as BatchedNMS_TRT) so the
+  // checker below does not reject the model (GitHub issues #107, #220).
+  RegisterCustomDefaultDomainOpSchemas(model);
 
   Check(model);
 
