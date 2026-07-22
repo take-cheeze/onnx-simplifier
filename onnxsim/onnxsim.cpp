@@ -574,11 +574,26 @@ bool GetStaticIntTensorInfo(
 // This pass rewrites every node whose lone output has a fully concrete
 // propagated value into a `Constant` node. Downstream ops then fold through the
 // ordinary constant folder, and now-dead nodes are removed by the optimizer.
-onnx::ModelProto _EvalPartialShape(const onnx::ModelProto& input_model) {
-  onnx::ModelProto model;
+void _EvalPartialShape(onnx::ModelProto& model) {
+  // This pass runs shape inference with *data propagation* (lenient options)
+  // purely to discover foldable shape values; it must not otherwise change the
+  // model. InferShapes mutates value_info and output types in place, so
+  // snapshot those annotations and restore them on the paths that fold nothing,
+  // leaving the model byte-for-byte unchanged (the old code returned the
+  // untouched input there). The snapshot is metadata only -- no tensor weights
+  // -- so it is cheap, unlike the full-model ``CopyFrom`` it replaces. Restoring
+  // also keeps this pass's data-propagation value_info out of the model, which
+  // matters: it differs from the regular shape-inference pass's value_info, and
+  // leaving it behind could make the outer fixed point oscillate.
+  auto saved_value_info = model.graph().value_info();
+  auto saved_output = model.graph().output();
+  auto restore = [&]() {
+    *model.mutable_graph()->mutable_value_info() = saved_value_info;
+    *model.mutable_graph()->mutable_output() = saved_output;
+  };
+
   onnx::shape_inference::DataValueMap data_map;
   try {
-    model.CopyFrom(input_model);
     const onnx::ShapeInferenceOptions options(/*check_type=*/false,
                                               /*error_mode=*/0,
                                               /*enable_data_propagation=*/true);
@@ -586,11 +601,13 @@ onnx::ModelProto _EvalPartialShape(const onnx::ModelProto& input_model) {
                                        options, &data_map);
   } catch (const std::exception&) {
     // If shape inference fails we simply have no propagated values to exploit.
-    return input_model;
+    restore();
+    return;
   }
 
   if (data_map.empty()) {
-    return input_model;
+    restore();
+    return;
   }
 
   const auto type_map = BuildTypeMap(model);
@@ -663,7 +680,8 @@ onnx::ModelProto _EvalPartialShape(const onnx::ModelProto& input_model) {
   }
 
   if (folded_values.empty()) {
-    return input_model;
+    restore();
+    return;
   }
 
   // Rewrite each foldable node into a `Constant` node in the same position,
@@ -688,7 +706,6 @@ onnx::ModelProto _EvalPartialShape(const onnx::ModelProto& input_model) {
     attr->set_type(onnx::AttributeProto::TENSOR);
     *attr->mutable_t() = std::move(iter->second);
   }
-  return model;
 }
 
 onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
@@ -953,7 +970,8 @@ onnx::ModelProto Simplify(
     FoldConstant = [&executor](onnx::ModelProto& model) {
       // Partial shape evaluation (issue #139) turns Shape/Gather-on-shape into
       // constants that the ordinary constant folder can then propagate.
-      model = _FoldConstant(executor, _EvalPartialShape(model));
+      _EvalPartialShape(model);
+      model = _FoldConstant(executor, model);
     };
   } else {
     FoldConstant = Identity;
