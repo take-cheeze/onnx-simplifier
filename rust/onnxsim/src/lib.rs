@@ -1,0 +1,419 @@
+//! Safe Rust bindings to the [ONNX Simplifier](https://github.com/onnxsim/onnxsim)
+//! (`onnxsim`).
+//!
+//! ONNX models exported from training frameworks often contain redundant
+//! operators — dynamic shape gymnastics, no-op reshapes, constant subgraphs.
+//! `onnxsim` runs shape inference and constant folding to replace those with
+//! their computed results, producing a smaller, simpler, semantically identical
+//! graph. This crate wraps the same C++ core the Python package and CLI use, so
+//! Rust projects (e.g. model importers) can simplify models in-process instead
+//! of shelling out.
+//!
+//! # Quick start
+//!
+//! Simplify a model already in memory as serialized `ModelProto` bytes:
+//!
+//! ```no_run
+//! fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
+//!     let model_bytes: Vec<u8> = std::fs::read("model.onnx")?;
+//!     let simplified: Vec<u8> = onnxsim::simplify(&model_bytes)?;
+//!     std::fs::write("model.opt.onnx", &simplified)?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! Or operate directly on files (lets the C++ side stream models larger than
+//! would be convenient to hold in a single buffer):
+//!
+//! ```no_run
+//! fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
+//!     onnxsim::simplify_path("model.onnx", "model.opt.onnx")?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # Tuning
+//!
+//! [`Options`] controls constant folding, shape inference, which optimizer
+//! passes run, and the size threshold for folded tensors:
+//!
+//! ```no_run
+//! fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
+//!     let opts = onnxsim::Options::new()
+//!         .shape_inference(false) // some models crash ONNX shape inference
+//!         .skip_optimizer("eliminate_nop_transpose");
+//!     let simplified = onnxsim::simplify_with(&std::fs::read("model.onnx")?, &opts)?;
+//!     Ok(())
+//! }
+//! ```
+
+use std::ffi::{CStr, CString};
+use std::fmt;
+use std::os::raw::{c_char, c_int, c_void};
+use std::path::Path;
+use std::ptr;
+
+/// Default upper bound on the byte size of a constant-folded tensor kept as an
+/// initializer. Matches the Python package default of `1.5GB`.
+pub const DEFAULT_TENSOR_SIZE_THRESHOLD: usize = 1_610_612_736; // 1.5 * 2^30
+
+/// Errors returned by the simplifier.
+#[derive(Debug)]
+pub enum Error {
+    /// The C++ core reported a failure. Carries its message.
+    Simplify(String),
+    /// An argument could not be converted for the FFI boundary (e.g. a path or
+    /// optimizer name containing an interior NUL byte, or a non-UTF-8 path).
+    InvalidArgument(String),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Simplify(msg) => write!(f, "onnxsim failed: {msg}"),
+            Error::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// Configuration for a simplification run.
+///
+/// Build with [`Options::new`] and the chained setters; every field has a sane
+/// default so `Options::default()` reproduces the CLI's out-of-the-box
+/// behaviour (all passes on, constant folding and shape inference enabled).
+#[derive(Debug, Clone)]
+pub struct Options {
+    /// Optimizer-pass control.
+    /// * `None` — skip **all** optimizer passes (no graph optimization).
+    /// * `Some(list)` — run every fuse/elimination pass except the names in
+    ///   `list` (an empty list runs them all).
+    skip_optimizers: Option<Vec<String>>,
+    constant_folding: bool,
+    shape_inference: bool,
+    tensor_size_threshold: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            skip_optimizers: Some(Vec::new()),
+            constant_folding: true,
+            shape_inference: true,
+            tensor_size_threshold: DEFAULT_TENSOR_SIZE_THRESHOLD,
+        }
+    }
+}
+
+impl Options {
+    /// Create options with the default configuration.
+    pub fn new() -> Self {
+        Options::default()
+    }
+
+    /// Enable or disable constant folding (default: enabled).
+    pub fn constant_folding(mut self, enabled: bool) -> Self {
+        self.constant_folding = enabled;
+        self
+    }
+
+    /// Enable or disable ONNX shape inference (default: enabled).
+    ///
+    /// Disabling can be a useful workaround: shape inference occasionally
+    /// crashes or errors on unusual models.
+    pub fn shape_inference(mut self, enabled: bool) -> Self {
+        self.shape_inference = enabled;
+        self
+    }
+
+    /// Set the maximum byte size of a constant-folded tensor that will be kept
+    /// as an initializer (default: [`DEFAULT_TENSOR_SIZE_THRESHOLD`]).
+    pub fn tensor_size_threshold(mut self, bytes: usize) -> Self {
+        self.tensor_size_threshold = bytes;
+        self
+    }
+
+    /// Disable **all** optimizer passes. Constant folding and shape inference
+    /// (if enabled) still run.
+    pub fn without_optimizers(mut self) -> Self {
+        self.skip_optimizers = None;
+        self
+    }
+
+    /// Run every optimizer pass except the ones named here.
+    ///
+    /// Replaces any previously configured skip list and re-enables optimization
+    /// if it had been turned off with [`Options::without_optimizers`]. Use
+    /// [`list_optimizers`] to discover valid names.
+    pub fn skip_optimizers<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.skip_optimizers = Some(names.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Add a single optimizer pass to the skip list (enabling optimization if it
+    /// was disabled).
+    pub fn skip_optimizer<S: Into<String>>(mut self, name: S) -> Self {
+        self.skip_optimizers
+            .get_or_insert_with(Vec::new)
+            .push(name.into());
+        self
+    }
+}
+
+/// Simplify a serialized ONNX `ModelProto` with default options.
+///
+/// Returns the serialized simplified model.
+pub fn simplify(model_bytes: &[u8]) -> Result<Vec<u8>, Error> {
+    simplify_with(model_bytes, &Options::default())
+}
+
+/// Simplify a serialized ONNX `ModelProto` with the given [`Options`].
+///
+/// Returns the serialized simplified model.
+pub fn simplify_with(model_bytes: &[u8], options: &Options) -> Result<Vec<u8>, Error> {
+    let ffi = FfiSkipOptimizers::new(options)?;
+
+    let mut out_data: *mut c_void = ptr::null_mut();
+    let mut out_size: usize = 0;
+    let mut out_error: *mut c_char = ptr::null_mut();
+
+    let status = unsafe {
+        onnxsim_sys::onnxsim_simplify(
+            model_bytes.as_ptr() as *const c_void,
+            model_bytes.len(),
+            ffi.ptr(),
+            ffi.len(),
+            ffi.is_null_flag(),
+            bool_to_c(options.constant_folding),
+            bool_to_c(options.shape_inference),
+            options.tensor_size_threshold,
+            &mut out_data,
+            &mut out_size,
+            &mut out_error,
+        )
+    };
+
+    if status == onnxsim_sys::ONNXSIM_OK {
+        // Copy the C-owned buffer into a Vec, then release the original.
+        let result =
+            unsafe { std::slice::from_raw_parts(out_data as *const u8, out_size) }.to_vec();
+        unsafe { onnxsim_sys::onnxsim_free_buffer(out_data) };
+        Ok(result)
+    } else {
+        Err(take_error(out_error))
+    }
+}
+
+/// Simplify the model at `input_path`, writing the result to `output_path`,
+/// using default options.
+pub fn simplify_path<P: AsRef<Path>, Q: AsRef<Path>>(
+    input_path: P,
+    output_path: Q,
+) -> Result<(), Error> {
+    simplify_path_with(input_path, output_path, &Options::default())
+}
+
+/// Simplify the model at `input_path`, writing the result to `output_path`,
+/// using the given [`Options`].
+pub fn simplify_path_with<P: AsRef<Path>, Q: AsRef<Path>>(
+    input_path: P,
+    output_path: Q,
+    options: &Options,
+) -> Result<(), Error> {
+    let in_c = path_to_cstring(input_path.as_ref())?;
+    let out_c = path_to_cstring(output_path.as_ref())?;
+    let ffi = FfiSkipOptimizers::new(options)?;
+
+    let mut out_error: *mut c_char = ptr::null_mut();
+    let status = unsafe {
+        onnxsim_sys::onnxsim_simplify_path(
+            in_c.as_ptr(),
+            out_c.as_ptr(),
+            ffi.ptr(),
+            ffi.len(),
+            ffi.is_null_flag(),
+            bool_to_c(options.constant_folding),
+            bool_to_c(options.shape_inference),
+            options.tensor_size_threshold,
+            &mut out_error,
+        )
+    };
+
+    if status == onnxsim_sys::ONNXSIM_OK {
+        Ok(())
+    } else {
+        Err(take_error(out_error))
+    }
+}
+
+/// Return the names of all available fuse/elimination optimizer passes.
+///
+/// These are the names accepted by [`Options::skip_optimizer`] and
+/// [`Options::skip_optimizers`].
+pub fn list_optimizers() -> Vec<String> {
+    let raw = unsafe { onnxsim_sys::onnxsim_list_optimizers() };
+    if raw.is_null() {
+        return Vec::new();
+    }
+    let text = unsafe { CStr::from_ptr(raw) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { onnxsim_sys::onnxsim_free_string(raw) };
+    text.lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Owns the `CString`s and pointer array backing the `skip_optimizers` FFI
+/// arguments, keeping them alive for the duration of a call.
+struct FfiSkipOptimizers {
+    // `_owned` keeps the C strings alive; `ptrs` points into them.
+    _owned: Vec<CString>,
+    ptrs: Vec<*const c_char>,
+    is_null: bool,
+}
+
+impl FfiSkipOptimizers {
+    fn new(options: &Options) -> Result<Self, Error> {
+        match &options.skip_optimizers {
+            None => Ok(FfiSkipOptimizers {
+                _owned: Vec::new(),
+                ptrs: Vec::new(),
+                is_null: true,
+            }),
+            Some(names) => {
+                let mut owned = Vec::with_capacity(names.len());
+                for name in names {
+                    let c = CString::new(name.as_str()).map_err(|_| {
+                        Error::InvalidArgument(format!(
+                            "optimizer name contains an interior NUL byte: {name:?}"
+                        ))
+                    })?;
+                    owned.push(c);
+                }
+                let ptrs = owned.iter().map(|c| c.as_ptr()).collect();
+                Ok(FfiSkipOptimizers {
+                    _owned: owned,
+                    ptrs,
+                    is_null: false,
+                })
+            }
+        }
+    }
+
+    fn ptr(&self) -> *const *const c_char {
+        if self.ptrs.is_empty() {
+            ptr::null()
+        } else {
+            self.ptrs.as_ptr()
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.ptrs.len()
+    }
+
+    fn is_null_flag(&self) -> c_int {
+        bool_to_c(self.is_null)
+    }
+}
+
+fn bool_to_c(value: bool) -> c_int {
+    if value {
+        1
+    } else {
+        0
+    }
+}
+
+/// Consume a C-owned error string, returning a Rust `Error` and freeing the
+/// original allocation.
+fn take_error(out_error: *mut c_char) -> Error {
+    if out_error.is_null() {
+        return Error::Simplify("unknown error (no message provided)".to_string());
+    }
+    let message = unsafe { CStr::from_ptr(out_error) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { onnxsim_sys::onnxsim_free_string(out_error) };
+    Error::Simplify(message)
+}
+
+#[cfg(unix)]
+fn path_to_cstring(path: &Path) -> Result<CString, Error> {
+    use std::os::unix::ffi::OsStrExt;
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        Error::InvalidArgument(format!("path contains an interior NUL byte: {path:?}"))
+    })
+}
+
+#[cfg(not(unix))]
+fn path_to_cstring(path: &Path) -> Result<CString, Error> {
+    let s = path
+        .to_str()
+        .ok_or_else(|| Error::InvalidArgument(format!("path is not valid UTF-8: {path:?}")))?;
+    CString::new(s).map_err(|_| {
+        Error::InvalidArgument(format!("path contains an interior NUL byte: {path:?}"))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These tests exercise pure-Rust logic and do not touch the FFI, so they
+    // run under `cargo test` even without the native library linked.
+
+    #[test]
+    fn default_options() {
+        let opts = Options::default();
+        assert!(opts.constant_folding);
+        assert!(opts.shape_inference);
+        assert_eq!(opts.skip_optimizers, Some(Vec::new()));
+        assert_eq!(opts.tensor_size_threshold, DEFAULT_TENSOR_SIZE_THRESHOLD);
+    }
+
+    #[test]
+    fn without_optimizers_sets_null() {
+        let opts = Options::new().without_optimizers();
+        let ffi = FfiSkipOptimizers::new(&opts).unwrap();
+        assert!(ffi.is_null);
+        assert_eq!(ffi.is_null_flag(), 1);
+        assert!(ffi.ptr().is_null());
+    }
+
+    #[test]
+    fn skip_optimizer_reenables_optimization() {
+        let opts = Options::new()
+            .without_optimizers()
+            .skip_optimizer("eliminate_nop_transpose");
+        assert_eq!(
+            opts.skip_optimizers,
+            Some(vec!["eliminate_nop_transpose".to_string()])
+        );
+    }
+
+    #[test]
+    fn ffi_skip_optimizers_layout() {
+        let opts = Options::new().skip_optimizers(["a", "bb"]);
+        let ffi = FfiSkipOptimizers::new(&opts).unwrap();
+        assert!(!ffi.is_null);
+        assert_eq!(ffi.len(), 2);
+        assert!(!ffi.ptr().is_null());
+    }
+
+    #[test]
+    fn interior_nul_is_rejected() {
+        let opts = Options::new().skip_optimizer("bad\0name");
+        assert!(matches!(
+            FfiSkipOptimizers::new(&opts),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+}

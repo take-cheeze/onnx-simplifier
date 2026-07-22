@@ -17,6 +17,7 @@ set(CMAKE_CXX_STANDARD 20)
 option(ONNXSIM_PYTHON "" OFF)
 option(ONNXSIM_BUILTIN_ORT "" ON)
 option(ONNXSIM_WASM_NODE "For node (enable NODERAWFS etc.)" OFF)
+option(ONNXSIM_C_API "Build the C ABI shared library used by the Rust wrapper and other FFI consumers" OFF)
 
 if (ONNXSIM_PYTHON AND EMSCRIPTEN)
   message(STATUS "python and emscripten cannot be built at the same time")
@@ -36,6 +37,13 @@ endif()
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if (ONNXSIM_BUILTIN_ORT)
+  # The top-level project only enables CXX, but ONNX Runtime (added below as a
+  # subdirectory) compiles C and assembly sources. Enable the languages it needs
+  # before configuring it. Emscripten's toolchain handles this on its own.
+  if (NOT EMSCRIPTEN)
+    enable_language(C)
+    enable_language(ASM)
+  endif()
   include(cmake/build_ort.cmake)
   if (EMSCRIPTEN)
     set(ORT_NAME onnxruntime_webassembly)
@@ -77,6 +85,30 @@ if (EMSCRIPTEN)
   target_link_libraries(onnxsim_bin embind "-Wl,--whole-archive" onnxsim "-Wl,--no-whole-archive")
 else()
   target_link_libraries(onnxsim_bin onnxsim)
+endif()
+
+if (ONNXSIM_C_API)
+  if (NOT ONNXSIM_BUILTIN_ORT)
+    message(FATAL_ERROR "ONNXSIM_C_API requires ONNXSIM_BUILTIN_ORT=ON")
+  endif()
+  # In the builtin-ORT path onnx_optimizer is built as a shared library
+  # (build_ort.cmake sets BUILD_SHARED_LIBS ON), but it inherits the
+  # project-wide "hidden" visibility preset, so it exports none of its symbols.
+  # onnxsim/onnxsim_c call into it across the shared-library boundary (e.g.
+  # OptimizeFixed, GetFuseAndEliminationPass), which then fail to resolve at
+  # runtime with "undefined symbol". Restore default visibility so those symbols
+  # are exported. (The Python build avoids this by linking it statically.)
+  if (TARGET onnx_optimizer)
+    set_target_properties(onnx_optimizer PROPERTIES CXX_VISIBILITY_PRESET default
+                                                    VISIBILITY_INLINES_HIDDEN FALSE)
+  endif()
+  add_library(onnxsim_c SHARED onnxsim/capi/onnxsim_c_api.cpp)
+  target_link_libraries(onnxsim_c PRIVATE onnxsim onnx_optimizer onnx)
+  target_include_directories(onnxsim_c PUBLIC onnxsim/capi)
+  # The exported symbols opt back into default visibility via ONNXSIM_C_API in
+  # the header, so the project-wide "hidden" preset keeps everything else local.
+  set_target_properties(onnxsim_c PROPERTIES C_VISIBILITY_PRESET hidden
+                                             CXX_VISIBILITY_PRESET hidden)
 endif()
 
 if (ONNXSIM_PYTHON)
