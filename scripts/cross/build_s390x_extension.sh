@@ -185,7 +185,7 @@ cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" -G Ninja -Wno-dev -Wdeprecated \
   -DONNXSIM_PYTHON=ON \
   -DONNXSIM_BUILTIN_ORT=OFF \
   -DONNXSIM_TESTS=ON \
-  -DONNX_USE_LITE_PROTO=OFF \
+  -DONNX_USE_LITE_PROTO=ON \
   -DONNX_USE_PROTOBUF_SHARED_LIBS=OFF \
   -DONNX_CUSTOM_PROTOC_EXECUTABLE="${HOST_PROTOC}" \
   -DCMAKE_PREFIX_PATH="${DEPS_TARGET};${NANOBIND_CMAKE_DIR}" \
@@ -202,35 +202,73 @@ cmake --build "${BUILD_DIR}" --target onnx_cpp2py_export -j "${JOBS}"
 # the one that covers the byte-order conversion directly; the rest come along
 # because they are cheap and exercise the same cross-built toolchain.
 # tensor_pool_dtype_test/tensor_pool_test (safetensors) and
-# gguf_dtype_test/tensor_pool_gguf_test (GGUF) are likewise dependency-free
-# (each format's own byte-order handling; see tensor_pool.h's "Byte order"
-# note and tensor_pool_gguf.cpp's mirror of it) and belong in this list for
-# the same reason. ggml_kquant_test (the GGML K-quant dequantization
-# ggml_kquant.h implements -- decoded values are real numeric output, not
-# just copied bytes, so this is exactly the kind of logic a big-endian run
-# needs to check) is dependency-free too, for the same reason.
+# gguf_dtype_test/tensor_pool_gguf_test/read_gguf_metadata_test (GGUF) are
+# likewise dependency-free (each format's own byte-order handling; see
+# tensor_pool.h's "Byte order" note and tensor_pool_gguf.cpp's mirror of it)
+# and belong in this list for the same reason. ggml_kquant_test (the GGML
+# K-quant dequantization ggml_kquant.h implements -- decoded values are real
+# numeric output, not just copied bytes, so this is exactly the kind of logic
+# a big-endian run needs to check) is dependency-free too, for the same
+# reason.
 # tensor_pool_hash_test (TensorPool::ContentHash's BLAKE3 / SHA-256
 # backends) is dependency-free too and belongs here for the same reason --
 # CMake still registers each of these as a ctest target even if left off
 # this list, so omitting one here doesn't skip its test, it makes ctest try
 # to exec a binary that was never built: an instant, silent "Failed 0.00
 # sec" with no output, indistinguishable at a glance from a real crash.
+# ggml_mxfp4_test (the GGML MXFP4 dequantization ggml_mxfp4.h implements --
+# same rationale as ggml_kquant_test above: decoded values are real numeric
+# output, not just copied bytes) is dependency-free too and belongs here for
+# the same reason. ggml_legacy_quant_test (the GGML Q4_0/Q4_1/Q5_0/Q5_1
+# dequantization ggml_legacy_quant.h implements) is dependency-free for the
+# same reason too. memory_planning_test builds on model_metrics' GraphView/
+# liveness core (see its CMakeLists.txt comment) and is likewise
+# ONNX-free, so it belongs here too.
 cmake --build "${BUILD_DIR}" --target sym_expr_test model_metrics_test \
   sym_value_eval_test sym_shape_infer_test dlpack_dtype_test \
   tensor_pool_dtype_test tensor_pool_test tensor_pool_hash_test \
-  gguf_dtype_test ggml_kquant_test tensor_pool_gguf_test -j "${JOBS}"
+  gguf_dtype_test ggml_kquant_test ggml_mxfp4_test ggml_legacy_quant_test \
+  tensor_pool_gguf_test read_gguf_metadata_test memory_planning_test \
+  -j "${JOBS}"
 # tensor_pool_bridge_test, tensor_pool_gguf_bridge_test,
-# tensor_pool_archive_test, and precision_estimator_test are NOT
-# dependency-free (they exercise onnx::ModelProto / the TensorProto <->
-# TensorPool bridges), but the onnx/onnx-optimizer static libraries they need
-# are already built as a side effect of the onnxsim_cpp2py_export target
-# above, so they cost only their own link step here rather than a second onnx
-# build. precision_estimator_test in particular is exactly the kind of test a
-# big-endian run needs: it exercises the raw_data byte-order handling
-# precision_estimator.cpp's ReadFloatTensorFlat does for real weight tensors.
+# tensor_pool_archive_test, precision_estimator_test,
+# contrib_schemas_moe_test, and xnnpack_codegen_test are NOT dependency-free
+# (they exercise onnx::ModelProto / the TensorProto <-> TensorPool bridges,
+# or in contrib_schemas_moe_test's case onnx::OpSchemaRegistry and
+# FunctionBodyBuildContext), but the onnx/onnx-optimizer static libraries
+# they need are already built as a side effect of the onnxsim_cpp2py_export
+# target above, so they cost only their own link step here rather than a
+# second onnx build. precision_estimator_test in particular is exactly the
+# kind of test a big-endian run needs: it exercises the raw_data byte-order
+# handling precision_estimator.cpp's ReadFloatTensorFlat does for real
+# weight tensors. xnnpack_codegen_test exercises xnnpack_codegen.cpp's own
+# GetTensorFloatData, which has the identical raw_data byte-order concern.
+# qat_graph_builder_test and qat_graph_parity_test earn their place on that
+# same criterion rather than for coverage's sake: qat_graph_builder.cpp's
+# Const() *writes* TensorProto raw_data, and the parity test reads it back,
+# so a big-endian run exercises both directions of the conversion. The
+# parity test is the sharper of the two -- it compares against a fixture
+# generated on a little-endian host, so it fails if either side of the round
+# trip picks up a host-order assumption. graph_grad_test comes along because
+# it builds NodeProtos through the same emitter and costs only its link step.
+# qat_entry_test meets the same criterion and is the broadest of them:
+# qat_entry.cpp reads float weights and scales out of raw_data, packs INT4
+# codes back into it two to a byte, and round-trips a whole model through
+# both directions. It was also, briefly, the worked example of the trap
+# described above -- added to CMakeLists.txt, left off this list, and so an
+# instant "Failed 0.00 sec" rather than a test that did not run.
+#
+# Adding a target here is half the job. The workflow that runs this script is
+# path-filtered, so a test built here whose source is not listed in
+# .github/workflows/big-endian.yml never runs on a pull request that changes
+# it -- it waits for the Monday schedule. Both lists have to move together:
+# add the target here, add its source there.
 cmake --build "${BUILD_DIR}" --target tensor_pool_bridge_test \
   tensor_pool_gguf_bridge_test tensor_pool_archive_test \
-  precision_estimator_test -j "${JOBS}"
+  precision_estimator_test contrib_schemas_moe_test xnnpack_codegen_test \
+  graph_grad_test qat_graph_builder_test qat_graph_parity_test \
+  qat_entry_test \
+  -j "${JOBS}"
 
 SO="$(find "${BUILD_DIR}" -name 'onnxsim_cpp2py_export*.so' -print -quit)"
 [[ -n "${SO}" ]] || { echo "no extension module produced"; exit 1; }

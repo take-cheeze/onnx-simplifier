@@ -1,5 +1,28 @@
 # onnx-finetune-wasm
 
+**Knowledge distillation runs through a completely separate browser runner that avoids
+everything in this file's "Status" section below: `distill_step_graph/`.** It runs a step
+graph from `../scripts/generate_distillation_step_graph.py` (onnxsim's own graph_grad/qat_graph
+autodiff, not `onnxruntime.training`) via the *official* `onnxruntime-web` npm package's plain
+`ort.InferenceSession` -- no Embind wrapper, no custom Emscripten build, no
+`--enable_training_apis` at all, and it sidesteps the "memory access out of bounds" bug below
+entirely (that bug is in a training-op kernel this path never touches). See
+`../README.md`'s "Knowledge distillation" section and
+`distill_step_graph/step_graph_runner.mjs`/`.test.mjs`. Everything below this point describes
+the *other* runner (`src/onnx_finetune_wasm.cpp`, the Embind wrapper around
+`Ort::TrainingSession`), which still needs the from-source build, still has this file's own
+unresolved memory bug, and has no distillation support of its own at all -- for that, use
+`distill_step_graph/` instead.
+
+The step-graph runners (`distill_step_graph/` and `federated_lora/`) default to
+onnxruntime-web's wasm (CPU) execution provider. On a desktop browser with a
+Vulkan driver, pass `{ executionProviders: ["webgpu", "wasm"] }` to
+`StepGraphSession.create` to run the training step graph on WebGPU -- the
+browser's own GPU API, which Chromium serves over that Vulkan driver -- with
+onnxruntime-web falling back to the wasm CPU kernels for any op WebGPU cannot
+run. WebGPU needs a real browser page (`navigator.gpu`), which is why the
+wasm default stays put under plain Node.
+
 Same training loop as `../src/main.cpp` (the native CLI), compiled to
 WebAssembly and exposed to JS via Embind instead of argv, so it can run
 fine-tuning entirely client-side in a browser tab.
@@ -45,7 +68,7 @@ absolute prefix.
 **Runtime: partially exercised, currently flaky.** Loaded the compiled
 module in Node (bundled with emsdk, not a browser) and ran a real training
 loop against the same toy artifacts the native CLI's example uses. First
-attempt: the full 20-epoch loop ran and the loss converged
+attempt (historical): the full 20-epoch loop ran and the loss converged
 (5.06 -> ~0.00001, matching the native CLI almost exactly) -- genuine
 confirmation the training loop executes correctly in wasm -- but
 `exportModel()` then failed with an undecodable raw exception pointer
@@ -56,16 +79,29 @@ lives on `onnxruntime_webassembly`'s LINK_FLAGS in
 is a bundled `STATIC IMPORTED` library rather than the final linked module)
 -- but `build.ninja` shows the flag was already present globally via ORT's
 own wasm CXX flags both before and after that change, so it wasn't actually
-the fix. Two rebuilds since then (with the flag change, then again with
-constructor/TrainStep try/catch diagnostics added) both fail *immediately*,
-before any training step runs at all -- a regression from the first
-successful run, cause not yet identified. Leading hypothesis, unconfirmed:
-JSEP/WebGPU EP init probing `navigator.gpu` during session construction,
-which doesn't exist in Node (only real browsers) -- would need a JSEP-off
-comparison build to confirm (a ~25min rebuild, not a quick check, since
-`-DUSE_JSEP=1` is baked into many cached object files). Whether it runs
-correctly in an actual browser (`example/`, where `navigator.gpu` is real)
-is untested.
+the fix.
+
+**Update, from re-testing while adding distillation support:** the earlier
+"JSEP/WebGPU EP probing `navigator.gpu`" hypothesis is **ruled out**. A
+`-DONNX_FINETUNE_WASM_WEBGPU=OFF` rebuild (no JSEP at all) still fails on
+the very first `trainStep()` call -- but now with a real, decodable error
+instead of an opaque pointer: `RuntimeError: memory access out of bounds`,
+thrown from inside a `dynCall`/`invoke_viiiii` trampoline (an indirect call
+into a training-op kernel). Reproduces at the smallest possible scale
+(`batch=1`, the plain 2-tensor training path, the exact toy regression
+model the README's own example uses) -- not something specific to larger
+batches or JSEP. This looks like a genuine wasm32-compiled-kernel memory
+bug in this exact onnxruntime v1.19.2 + emsdk 3.1.59 combination, not an
+application-level bug in this file or `../src/main.cpp` (both build clean
+and are exercised end to end by the *native* CLI without issue).
+Root-causing further needs bisecting onnxruntime commits/emsdk versions
+with a symbol-level (`-g`) debug build, which is out of scope here;
+`.github/workflows/onnx-finetune-training.yml`'s wasm job runs this
+anyway (so a future fix shows up as newly-green CI) but doesn't block on
+it. Whether it runs correctly in an actual browser (`example/`, untested
+either way) is unknown -- Node is where this was reproduced, and there's
+no reason to expect a browser's wasm engine to behave differently for a
+plain memory-safety bug like this.
 
 ## Design
 
@@ -93,6 +129,12 @@ native CLI's loop one-for-one:
 Batch construction, shuffling, and the epoch loop live in JS
 (`example/app.js`) rather than C++, same division of responsibility as the
 native CLI (C++ owns the training step, the caller owns the data loop).
+
+`trainStep`'s `target` always means whatever the training graph's `--loss`
+mode expects, marshaled as a `Float32Array` -- there is no int64-label
+support in this binding (only `--loss cross-entropy`/distillation artifacts
+would need that, and this binding has no distillation mode of its own; see
+the top of this file for the separate `distill_step_graph/` runner).
 
 ## Building
 

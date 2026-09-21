@@ -37,6 +37,13 @@
 struct ModelInfo {
   std::map<std::string, int64_t> op_nums;
   int64_t model_size = 0;
+  // Count of the top-level graph's own initializers -- not the recursive,
+  // subgraph-including tally that ``op_nums["Constant"]`` folds initializers
+  // into. Reported as its own "Initializers" row by ``FormatSimplifyingInfo``
+  // so a change here (e.g. weights folded into a fused node, or duplicate
+  // initializers deduplicated) is visible without it being muddied by actual
+  // ``Constant`` nodes in the same count.
+  int64_t initializer_count = 0;
   onnxsim::SymExpr macs;
   onnxsim::SymExpr mem_access;
   onnxsim::SymExpr memory_footprint;
@@ -52,6 +59,15 @@ struct ModelInfo {
 // inferred shapes itself, with data propagation) to avoid the extra pass.
 ModelInfo GetModelInfo(const onnx::ModelProto& model,
                        bool run_shape_inference = true);
+
+// Reduce `model`'s top-level graph to the ``GraphView`` model_metrics.h (and
+// its dependents, e.g. memory_planning.h) operate on: node connectivity plus
+// every fully-known tensor shape/dtype. Shares the exact same shape-inference
+// step ``GetModelInfo`` uses for its own metrics (best-effort: falls back to
+// `model`'s existing value_info if inference throws), so a caller building a
+// GraphView-based report sees the same shapes ``GetModelInfo`` would.
+onnxsim::GraphView GetGraphView(const onnx::ModelProto& model,
+                                bool run_shape_inference = true);
 
 // Write onnxsim's model-info metrics into ``model``'s ``metadata_props`` in
 // place, mirroring the Python ``model_info.annotate_metadata`` so downstream
@@ -71,8 +87,9 @@ void AnnotateModelInfo(onnx::ModelProto& model);
 
 // Render an ASCII table comparing an original and a simplified model, mirroring
 // the layout of the Python ``print_simplifying_info``: one row per op type (the
-// sorted union of both models' ops), then ``Model Size``, ``MACs``, ``FLOPs``,
-// ``Memory Access``, ``Memory Footprint`` and ``Compute Density``, with columns
+// sorted union of both models' ops), then ``Model Size``, ``Initializers``,
+// ``MACs``, ``FLOPs``, ``Memory Access``, ``Memory Footprint`` and
+// ``Compute Density``, with columns
 // for the original and simplified values. A metric that improved (a dropped op
 // count, or a smaller size / MACs / memory figure) is flagged with a trailing
 // ``*``, since these bindings print to plain terminals where the Python

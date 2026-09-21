@@ -8,10 +8,9 @@ dynamic = ["version"]
 description = "Simplify your ONNX model"
 readme = "README.md"
 license = "MIT AND (Apache-2.0 OR BSD-2-Clause)"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "onnx",
-    "rich",
 ]
 authors = [
     {name = "ONNX Simplifier Authors", email = "daquexian566@gmail.com"},
@@ -21,7 +20,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -30,15 +28,96 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
+# rich is used only to pretty-print terminal reports (the original-vs-simplified
+# table, the memory plan, the graph diff, CLI warnings). Without it those fall
+# back to plain-text tables via onnxsim._rich_compat; nothing about the produced
+# model changes. The 12.1.0 exclusion matches requirements.txt's long-standing
+# pin of that known-bad release.
+rich = ["rich != 12.1.0"]
 # onnxruntime is preferred for constant folding and correctness checking.
 # When it is not installed, onnxsim falls back to onnx's reference evaluator.
+# onnxsim.lora.export_lora_adapter additionally needs onnxruntime >= 1.20 for
+# its AdapterFormat class -- checked at call time via a hasattr guard, not
+# by raising this floor, since every other onnxruntime use in the package
+# (including the rest of onnxsim.lora/onnxsim.qat's own step-graph training)
+# works on far older onnxruntime.
 onnxruntime = ["onnxruntime >= 1.6.0"]
 # sympy lets the MACs/FLOPs report keep dynamic dimensions (dim_param, e.g.
 # "batch") as symbols and produce a formula instead of assuming them to be 1.
 symbolic = ["sympy"]
+# onnx-shape-inference (https://github.com/justinchuby/onnx-shape-inference) is
+# used by ModelInfo (the MACs/FLOPs/memory report) as a drop-in replacement for
+# onnx.shape_inference when installed: it resolves more shapes via symbolic
+# data propagation, so fewer nodes fall back to contributing 0. Falls back to
+# onnx.shape_inference when it is not installed.
+shape-inference = ["onnx-shape-inference"]
 # Needed by onnxsim.profile_plot.plot_node_reduction() / --node-reduction-plot,
 # which renders the "NodeCount" events in a simplify(..., profile=...) trace.
 plot = ["matplotlib"]
+# z3-solver backs tests/_formal_verify_common.py's translation-validation tests
+# (tests/test_formal_verify_*.py): each targeted optimizer rewrite gets a
+# hand-written Z3 proof that its documented algebra is a sound equivalence,
+# plus a differential check that the compiled pass, run in isolation, agrees
+# with that same algebra on concrete models. Unrelated to onnxsim's own
+# ONNX-to-ONNX pipeline; those tests are skipped (not failed) without it.
+verify = ["z3-solver"]
+# Needed by onnxsim.export_transformers_model(), which calls
+# optimum.exporters.onnx.main_export to turn a Hugging Face transformers model
+# into ONNX before simplifying it. Heavy and unrelated to onnxsim's own
+# ONNX-to-ONNX pipeline, so kept out of the base dependencies.
+transformers = ["torch", "transformers", "optimum[exporters]", "optimum-onnx"]
+# Needed by onnxsim.export_diffusion_model(), which calls
+# optimum.exporters.onnx.main_export to turn a Hugging Face diffusers
+# pipeline (Stable Diffusion, SDXL, ...) into ONNX before simplifying it.
+# Heavy and unrelated to onnxsim's own ONNX-to-ONNX pipeline, so kept out of
+# the base dependencies.
+diffusion = ["torch", "diffusers", "optimum[exporters]", "optimum-onnx"]
+# Needed by onnxsim.export_detectron_model(), which traces a Detectron2
+# (https://github.com/facebookresearch/detectron2) model to ONNX before
+# simplifying it. Only pulls in torch: detectron2 itself is not published to
+# PyPI, so it must be installed separately from source (see
+# onnxsim.export_detectron_model's docstring).
+detectron2 = ["torch"]
+# Needed by onnxsim.export_sam2_model(), which traces a Meta SAM 2
+# (https://github.com/facebookresearch/sam2) image encoder/decoder to ONNX
+# before simplifying each. Pulls in torch, samexporter (which implements the
+# encoder/decoder split this wraps), and hydra-core (SAM 2's config system).
+# The real 'sam2' package itself is not published to PyPI under its official
+# name, so it must be installed separately from source (see
+# onnxsim.export_sam2_model's docstring) -- do not substitute the unrelated,
+# unofficial same-named package that is on PyPI.
+sam2 = ["torch", "samexporter", "hydra-core"]
+# Needed by onnxsim.export_drivetransformer_model(), which traces a
+# DriveTransformer (https://github.com/Thinklab-SJTU/DriveTransformer)
+# end-to-end autonomous-driving model to ONNX before simplifying it. Only
+# pulls in torch: DriveTransformer's own "mmcv"/"mmdet"/"mmdet3d" are its own
+# bundled, merged fork (unrelated to the real PyPI mmcv), so it must be
+# installed separately from source (see
+# onnxsim.export_drivetransformer_model's docstring).
+drivetransformer = ["torch"]
+# Needed by onnxsim.torch_training.compile_torch_training_loop(), which
+# exports a real torch.nn.Module to ONNX via torch.export's FX graph
+# (torch.onnx.export(..., dynamo=True)) and hands the result to
+# onnxsim.compile_training_loop -- training itself still runs entirely on
+# onnxsim's own graph_grad/qat_graph, never on torch autograd, so this is
+# the only onnxsim module that needs torch at all. >= 2.5 is a real floor,
+# not a copy of the other torch extras' unpinned ones: that is the release
+# the dynamo=True exporter argument landed in (it replaced the older,
+# separate torch.onnx.dynamo_export() function). onnxscript is torch.onnx's
+# own dynamo exporter's dependency, not onnxsim's -- torch.onnx.export(...,
+# dynamo=True) imports it lazily and fails with a bare "No module named
+# 'onnxscript'" if it is missing, so it is listed here too rather than left
+# for that confusing error to surface.
+torch-training = ["torch >= 2.5", "onnxscript"]
+# Needed by onnxsim.webgpu_tinygrad_codegen, which builds real tinygrad
+# Tensor graphs and renders them to WGSL via tinygrad's own WGSLRenderer to
+# generate WebGPU kernels for the gaps onnxsim.webgpu_target flags (Conv
+# with a 3-D spatial rank, Resize align_corners). Never imported unless a
+# caller calls one of that module's generate_* functions -- see its own
+# docstring for why it depends on tinygrad's actual (not a stable public
+# API) internals, and why no real GPU/dawn library is needed just to
+# generate a kernel. Built and verified against tinygrad==0.14.0.
+webgpu-codegen = ["tinygrad == 0.14.0"]
 
 [project.urls]
 Homepage = "https://github.com/onnxsim/onnxsim"
@@ -51,10 +130,24 @@ onnxsim = "onnxsim:main"
 # this list into the GitHub Actions job summary when running in CI, so the
 # timings are visible without opening the raw logs.
 addopts = "--durations=10"
+# Auto-applied by tests/conftest.py's pytest_collection_modifyitems based on
+# each test file's name -- see that hook for the exact matching rules. Used
+# by .github/workflows/build-and-test.yml to skip these backend/algorithm-
+# specific suites on every build_wheels leg and the Windows cross-test job
+# (they have no OS/arch/interpreter-dependent behavior, so running them on
+# every wheel-test leg is redundant CI time); they instead run exactly once,
+# in that workflow's dedicated test_axera_quantization_pruning job.
+markers = [
+    "axera: Axera Pulsar2/AXCL NPU backend tests (test_axera_*, test_axelera_*, test_pulsar2_*, test_voyager_sdk_patterns.py)",
+    "quantization: quantization algorithm/format tests (filename contains 'quant' or 'gguf')",
+    "pruning: pruning algorithm tests (filename contains 'prun')",
+]
 
 [tool.ruff]
 # The vendored single-header option parser is not our code to reformat.
-extend-exclude = ["onnxsim/cxxopts.hpp"]
+# tflite_schema/schema_py_generated.py is flatc-generated TFLite schema
+# bindings (see that file's own header) -- not our code either.
+extend-exclude = ["onnxsim/cxxopts.hpp", "tools/onnx-cardputer-flash/scripts/tflite_schema/schema_py_generated.py"]
 
 [tool.ruff.lint]
 # pycodestyle errors (E), Pyflakes (F), and isort (I). Import sorting is applied
@@ -64,7 +157,7 @@ select = ["E4", "E7", "E9", "F", "I"]
 [tool.mypy]
 # Type-check the Python package (not the tests, which lean on dynamic fixtures).
 files = ["onnxsim"]
-python_version = "3.10"
+python_version = "3.11"
 # onnx/numpy/onnxruntime/torch expose partial or no type information, the
 # compiled `onnxsim_cpp2py_export` extension has no stubs, and upstream stubs
 # are incomplete (e.g. onnx OpSchema methods). Treat every third-party import as

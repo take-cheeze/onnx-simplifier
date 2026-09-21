@@ -25,9 +25,11 @@
 // core/common/endian.h (which neither ships).
 #include "onnxruntime_cxx_api.h"
 #endif
+#include "bev_custom_op_schemas.h"
 #include "constant_folding.h"
 #include "contrib_schemas.h"
 #include "custom_optimizer_passes.h"
+#include "gemm_fusion_backend.h"
 #include "model_info.h"
 #include "model_prep.h"
 #include "onnx/common/file_utils.h"
@@ -36,12 +38,14 @@
 #include "onnx/defs/printer.h"
 #include "onnx/inliner/inliner.h"
 #include "onnx/shape_inference/implementation.h"
+#include "onnx/version_converter/convert.h"
 #include "onnxoptimizer/model_util.h"
 #include "onnxoptimizer/optimize.h"
 #include "onnxoptimizer/passes/cse_util.h"
 #include "onnxoptimizer/passes/logging.h"
 #include "partial_shape_eval.h"
 #include "profiler.h"
+#include "qonnx_schemas.h"
 #include "quantize_entry.h"
 
 onnx::ModelProto InferShapesOnce(const onnx::ModelProto& model) {
@@ -98,7 +102,8 @@ void RecordSimplifyOptionsMetadata(
     bool include_inline_functions, bool mutable_initializer,
     const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
         overwrite_input_shapes,
-    const std::optional<std::vector<std::string>>& unused_output) {
+    const std::optional<std::vector<std::string>>& unused_output,
+    const std::optional<std::vector<std::string>>& extra_optimizers) {
   auto join = [](const std::vector<std::string>& v) {
     std::string out;
     for (size_t i = 0; i < v.size(); ++i) {
@@ -149,18 +154,23 @@ void RecordSimplifyOptionsMetadata(
   if (unused_output) {
     options.emplace_back("onnxsim.unused_output", join(*unused_output));
   }
+  if (extra_optimizers) {
+    options.emplace_back("onnxsim.extra_optimizers", join(*extra_optimizers));
+  }
 
   // Every key this function could ever write, not just the ones present in
-  // `options` this call -- ``overwrite_input_shapes``/``unused_output`` are
-  // conditional, so a stale value one of them left behind on a previous
-  // simplify() call (that did set it) must still be cleared on a later call
-  // that doesn't, or it would look like it's still in effect.
+  // `options` this call -- ``overwrite_input_shapes``/``unused_output``/
+  // ``extra_optimizers`` are conditional, so a stale value one of them left
+  // behind on a previous simplify() call (that did set it) must still be
+  // cleared on a later call that doesn't, or it would look like it's still
+  // in effect.
   static const std::unordered_set<std::string> known_option_keys = {
       "onnxsim.skip_optimizers",          "onnxsim.constant_folding",
       "onnxsim.shape_inference",          "onnxsim.tensor_size_threshold",
       "onnxsim.target_opset_version",     "onnxsim.initializers_as_constants",
       "onnxsim.include_inline_functions", "onnxsim.mutable_initializer",
-      "onnxsim.overwrite_input_shapes",   "onnxsim.unused_output"};
+      "onnxsim.overwrite_input_shapes",   "onnxsim.unused_output",
+      "onnxsim.extra_optimizers"};
 
   auto* props = model.mutable_metadata_props();
   google::protobuf::RepeatedPtrField<onnx::StringStringEntryProto> kept;
@@ -187,15 +197,46 @@ size_t CountGraphNodes(const onnx::Graph& graph) {
       std::distance(graph.nodes().begin(), graph.nodes().end()));
 }
 
+// Builds the map InferShapesOnGraph (via OptAndShapeOnGraph/
+// _EvalPartialShapeOnGraph below) needs to infer through a model-local
+// function call: onnx::Graph carries no notion of model.functions() itself
+// (see graph_shape_inference.h's own doc comment), so any caller with a
+// ModelProto in hand builds this once, the same way
+// shape_inference::InferShapes(ModelProto&, ...) does internally for the
+// protobuf-based path. Key format (domain:name, or domain:name:overload for
+// an IR>=10 function overload) matches what every ONNX helper expects --
+// see graph_shape_inference.h's own doc comment.
+onnx::shape_inference::ModelLocalFunctionsMap BuildModelLocalFunctionsMap(
+    const onnx::ModelProto& model) {
+  onnx::shape_inference::ModelLocalFunctionsMap functions;
+  functions.reserve(static_cast<size_t>(model.functions_size()));
+  for (const auto& fn : model.functions()) {
+    std::string id = fn.domain() + ":" + fn.name();
+    if (!fn.overload().empty()) {
+      id += ":" + fn.overload();
+    }
+    functions.emplace(std::move(id), &fn);
+  }
+  return functions;
+}
+
 // Runs InferShapesOnGraph + OptimizeGraphFixed to their own inner fixed
 // point directly on `g`, with no ModelProto conversion at either end -- the
 // Graph-resident core shared by OptAndShape's ModelFn (which wraps this in
 // one Import before and one Export after, see below) and the fully
 // Graph-native outer Pipeline (which shares one Import/Export across the
 // *whole* outer fixed point instead, see Simplify's !rewriter branch).
+// `model_local_functions` is forwarded unchanged to InferShapesOnGraph (see
+// that function's own doc comment) -- Graph carries no notion of
+// model-local functions itself, so a caller whose model has any must build
+// this map from its own ModelProto.functions() and pass it in; omitted
+// (the default, empty), a model-local function call's output is left
+// untouched, exactly as if the op had no registered schema.
 // Returns whether anything changed.
 bool OptAndShapeOnGraph(onnx::Graph& g, bool optimize, bool shape_inference,
-                        size_t fixed_point_iters) {
+                        size_t fixed_point_iters,
+                        const onnx::shape_inference::ModelLocalFunctionsMap&
+                            model_local_functions = {}) {
   // See OptAndShape's own doc comment for why these caches are scoped to
   // one call of this function rather than cleared every round underneath.
   onnx::optimization::ClearTensorContentDigestCache();
@@ -203,9 +244,12 @@ bool OptAndShapeOnGraph(onnx::Graph& g, bool optimize, bool shape_inference,
   using GraphFnChanged = std::function<bool(onnx::Graph&)>;
   bool any_changed = false;
   GraphFnChanged InferShapesOnGraphChanged =
-      shape_inference ? GraphFnChanged([&any_changed](onnx::Graph& graph) {
+      shape_inference ? GraphFnChanged([&any_changed, &model_local_functions](
+                                           onnx::Graph& graph) {
         onnxsim::ProfiledScope scope("InferShapes");
-        const bool c = onnx::InferShapesOnGraph(graph);
+        const bool c =
+            onnx::InferShapesOnGraph(graph, onnx::ShapeInferenceOptions(),
+                                     nullptr, model_local_functions);
         any_changed |= c;
         return c;
       })
@@ -249,8 +293,18 @@ bool OptAndShapeOnGraph(onnx::Graph& g, bool optimize, bool shape_inference,
   return any_changed;
 }
 
-onnx::ModelProto Simplify(
+// Shared body of Simplify()/SimplifyConsumeInput() below, differing only in
+// how ``sim_model`` -- the mutable working copy the fixed point runs on --
+// gets built from ``model``. ``mutable_model`` is null (and ``model`` is
+// deep-copied into ``sim_model``, as always) for the plain, input-preserving
+// path; when non-null, it aliases ``model`` and this instead does the same
+// move-based ModelProto -> Graph -> ModelProto round trip already used for
+// OptAndShape's own resident Graph above (and Optimizer::optimize()'s own
+// consuming overload in onnxoptimizer/optimize.h) -- see
+// SimplifyConsumeInput's own doc comment for when that's safe to ask for.
+static onnx::ModelProto SimplifyImpl(
     const ModelExecutor& executor, const onnx::ModelProto& model,
+    onnx::ModelProto* mutable_model,
     std::optional<std::vector<std::string>> skip_optimizers,
     bool constant_folding, bool shape_inference, size_t tensor_size_threshold,
     std::optional<int> target_opset_version, const GraphRewriter* rewriter,
@@ -258,7 +312,8 @@ onnx::ModelProto Simplify(
     bool mutable_initializer,
     const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
         overwrite_input_shapes,
-    const std::optional<std::vector<std::string>>& unused_output) {
+    const std::optional<std::vector<std::string>>& unused_output,
+    const std::optional<std::vector<std::string>>& extra_optimizers) {
   // Register onnxsim's own optimizer passes into onnxoptimizer's registry
   // before the pass list is built below: fuse_attention, fuse_consecutive_mul,
   // fuse_mul_into_conv, fuse_preceding_mul_into_conv, fuse_rms_norm and
@@ -269,6 +324,14 @@ onnx::ModelProto Simplify(
   // Make shape inference aware of ONNX Runtime's quantized contrib operators
   // (QLinearAdd and friends) so shape deduction does not stop at them.
   onnxsim::RegisterContribOpSchemas();
+  // Likewise for the mmdeploy/mmcv/BEVDet custom ops this branch's
+  // rewrite_*_to_* passes decompose (MMCVMultiScaleDeformableAttention,
+  // MMCVDeformConv2d/MMCVModulatedDeformConv2d, TRTBatchedNMS/
+  // TRTBatchedRotatedNMS, bev_pool_v2).
+  onnxsim::RegisterBevCustomOpSchemas();
+  // Likewise for QONNX/FINN's Quant/BipolarQuant/Trunc/FloatQuant, the
+  // fake-quantization ops Brevitas exports by default.
+  onnxsim::RegisterQonnxCustomOpSchemas();
   // Correct the determinism metadata of ops ONNX mis-annotates (e.g. Range) so
   // constant folding does not skip them.
   FixupSchemaDeterminism();
@@ -289,17 +352,24 @@ onnx::ModelProto Simplify(
   // redundant here, and it aborts the whole process on graphs where a Gather
   // index cannot be statically resolved to an axis (common in dynamic-shape
   // detection models such as FasterRCNN). Always drop it from the pass list.
-  std::vector<std::string> always_disabled_passes = {"eliminate_shape_gather"};
-  // When initializers are treated as non-constant, keep ``Constant`` nodes in
-  // producer form: ``extract_constant_to_initializer`` would rewrite every
-  // Constant into an initializer, which -- being non-constant now -- would then
-  // block onnxsim's own constant folding of genuinely-constant subgraphs. The
-  // value-baking passes themselves already leave initializer weights alone via
-  // ``IsConstantTensor`` (see the onnx-optimizer changes), so only this
-  // representation-changing pass needs dropping.
-  if (!initializers_as_constants) {
-    always_disabled_passes.push_back("extract_constant_to_initializer");
-  }
+  // Always keep ``Constant`` nodes in producer form: onnxsim's own constant
+  // folder (constant_folding.cpp's GetConstantNodes/GetConstantNodesOnGraph)
+  // now leaves a ``Constant`` node untouched rather than baking it into an
+  // initializer, on the theory that a Constant node's value is not "graph
+  // weight data" the way an initializer is -- and materializes any fold that
+  // is not purely initializer-derived (directly or transitively) as a fresh
+  // Constant node of its own, so that distinction stays visible in the
+  // output model. ``extract_constant_to_initializer`` would erase it right
+  // back by rewriting every Constant into an initializer -- including ones
+  // onnxsim itself just created -- so it is always dropped from the pass
+  // list, not just when initializers are treated as non-constant (where it
+  // additionally has the correctness problem that its output, being
+  // non-constant, would block further folding of genuinely-constant
+  // subgraphs). The value-baking passes themselves already leave initializer
+  // weights alone via ``IsConstantTensor`` (see the onnx-optimizer changes),
+  // so only this representation-changing pass needs dropping.
+  std::vector<std::string> always_disabled_passes = {
+      "eliminate_shape_gather", "extract_constant_to_initializer"};
   auto is_disabled = [](const std::vector<std::string>& list,
                         const std::string& pass) {
     return std::find(list.begin(), list.end(), pass) != list.end();
@@ -349,6 +419,26 @@ onnx::ModelProto Simplify(
         !is_disabled(always_disabled_passes, batched_gemm)) {
       passes.push_back(batched_gemm);
     }
+    // extra_optimizers is the general form of the batched_gemm carve-out
+    // above: a caller-named pass -- typically PassType::Other, since
+    // GetFuseAndEliminationPass already covers every Fuse/Nop pass -- runs in
+    // addition to the default set. skip_optimizers/always_disabled_passes
+    // still apply, so an explicit --skip-optimization wins, and a name
+    // already present (e.g. the caller redundantly names a default-set pass)
+    // is not duplicated. An unknown name is deliberately not filtered out
+    // here: OptimizeGraphFixed's Optimizer construction looks every entry of
+    // ``passes`` up in the global pass registry and throws on one that does
+    // not exist, which is the desired behavior -- see extra_optimizers' own
+    // doc comment in onnxsim.h.
+    if (extra_optimizers) {
+      for (const auto& pass : *extra_optimizers) {
+        if (!is_disabled(*skip_optimizers, pass) &&
+            !is_disabled(always_disabled_passes, pass) &&
+            std::find(passes.begin(), passes.end(), pass) == passes.end()) {
+          passes.push_back(pass);
+        }
+      }
+    }
     config.optimizer_passes = passes;
   }
 
@@ -379,6 +469,18 @@ onnx::ModelProto Simplify(
       std::getenv("ONNXSIM_FIXED_POINT_ITERS")
           ? std::atoi(std::getenv("ONNXSIM_FIXED_POINT_ITERS"))
           : 50;
+
+  // Which runtime fuse_matmul_add_bias_into_gemm(_batched) should assume will
+  // execute the simplified model -- see gemm_fusion_backend.h. Mirrors
+  // ONNXSIM_FIXED_POINT_ITERS/ONNXSIM_PROFILE so it works from every binding
+  // without a signature change; set unconditionally (not just when the env
+  // var is present) so this call never inherits a setting left over from an
+  // unrelated prior Simplify() call in the same process.
+  onnxsim::SetGemmFusionBackend(
+      std::getenv("ONNXSIM_GEMM_FUSION_BACKEND")
+          ? onnxsim::ParseGemmFusionBackend(
+                std::getenv("ONNXSIM_GEMM_FUSION_BACKEND"))
+          : onnxsim::GemmFusionBackend::kOrtCpu);
 
   // Optionally profile every fixed-point function. Turned on by pointing
   // ``ONNXSIM_PROFILE`` at an output file (``ONNXSIM_PROFILE=1`` uses the
@@ -496,7 +598,8 @@ onnx::ModelProto Simplify(
         // are raw_data-heavy, and measured 98%+ of those hash calls were
         // otherwise recomputing a value already seen earlier in the same
         // run (see onnxsim issue #633).
-        OptAndShapeOnGraph(*g, optimize, shape_inference, fixed_point_iters);
+        OptAndShapeOnGraph(*g, optimize, shape_inference, fixed_point_iters,
+                           BuildModelLocalFunctionsMap(model));
         onnx::ModelProto out = onnx::PrepareOutput(model);
         onnx::ExportModelProto(&out, g, /*consume_tensor_data=*/true);
         // OptimizeGraphFixed never sees model-local functions (they live
@@ -560,57 +663,105 @@ onnx::ModelProto Simplify(
     // ModelProto-based OptAndShape/FoldConstant path.
     using GraphFn = std::function<void(onnx::Graph&)>;
     using GraphFnChanged = std::function<bool(onnx::Graph&)>;
+    // Built once from the outer, pre-simplification `model` (SimplifyImpl's
+    // own parameter, not `sim_model` or any later ModelFn's own `model`
+    // parameter) and captured by value into both closures below: neither
+    // OptAndShapeOnGraph nor _EvalPartialShapeOnGraph's own InferShapesOnGraph
+    // call otherwise has any way to reach model.functions(), and this map
+    // needs to outlive every round of the fixed point these two closures
+    // drive. Still correct when include_inline_functions has already
+    // inlined `sim_model`'s own function calls away by the time this runs
+    // (see that option's own doc comment) -- the map is simply unreferenced
+    // by any node in that case, not wrong.
+    const onnx::shape_inference::ModelLocalFunctionsMap model_local_functions =
+        BuildModelLocalFunctionsMap(model);
     GraphFnChanged OptAndShapeOnGraphChanged =
-        [optimize, shape_inference, fixed_point_iters](onnx::Graph& graph) {
+        [optimize, shape_inference, fixed_point_iters,
+         model_local_functions](onnx::Graph& graph) {
           onnxsim::ProfiledScope scope("OptAndShape");
           return OptAndShapeOnGraph(graph, optimize, shape_inference,
-                                    fixed_point_iters);
+                                    fixed_point_iters, model_local_functions);
         };
     // `fold_ir_version` is declared above, alongside `converged`: see its own
     // comment for why it cannot live in this block despite only being read
     // here and set (from `model.ir_version()`) in the `Pipeline` lambda
     // below.
     GraphFnChanged FoldConstantOnGraphChanged =
-        constant_folding
-            ? GraphFnChanged([&executor, &fold_ir_version](onnx::Graph& graph) {
-                onnxsim::ProfiledScope scope("FoldConstant");
-                const bool a = _EvalPartialShapeOnGraph(graph);
-                const bool b =
-                    _FoldConstantOnGraph(executor, graph, fold_ir_version);
-                if (onnxsim::Profiler::Instance().enabled()) {
-                  onnxsim::Profiler::Instance().RecordNodeCount(
-                      "FoldConstant", CountGraphNodes(graph));
-                }
-                return a || b;
-              })
-            : GraphFnChanged([](onnx::Graph&) { return false; });
+        constant_folding ? GraphFnChanged([&executor, &fold_ir_version,
+                                           model_local_functions](
+                                              onnx::Graph& graph) {
+          onnxsim::ProfiledScope scope("FoldConstant");
+          const bool a = _EvalPartialShapeOnGraph(graph, model_local_functions);
+          const bool b = _FoldConstantOnGraph(executor, graph, fold_ir_version);
+          if (onnxsim::Profiler::Instance().enabled()) {
+            onnxsim::Profiler::Instance().RecordNodeCount(
+                "FoldConstant", CountGraphNodes(graph));
+          }
+          return a || b;
+        })
+                         : GraphFnChanged([](onnx::Graph&) { return false; });
     GraphFn PipelineOnGraph =
         FixedPointFn(OptAndShapeOnGraphChanged, FoldConstantOnGraphChanged,
                      fixed_point_iters, &converged);
-    Pipeline = Profiled("Pipeline", [PipelineOnGraph, &fold_ir_version](
-                                        onnx::ModelProto& model) {
-      std::shared_ptr<onnx::Graph> g(onnx::ImportModelProto(model));
-      if (g.get() == nullptr) {
-        // Same fallback as Optimizer::optimize(): if we can't parse the
-        // model, leave it untouched.
-        return;
-      }
-      fold_ir_version = model.ir_version();
-      PipelineOnGraph(*g);
-      onnx::ModelProto out = onnx::PrepareOutput(model);
-      onnx::ExportModelProto(&out, g, /*consume_tensor_data=*/true);
-      // OptimizeGraphFixed never sees model-local functions (they live on
-      // ModelProto, not Graph), so carry them over unchanged -- mirroring
-      // Optimizer::optimize()'s own AddFunctionsToModel.
-      for (const auto& function_proto : model.functions()) {
-        *out.add_functions() = function_proto;
-      }
-      model = std::move(out);
-    });
+    Pipeline =
+        Profiled("Pipeline", [PipelineOnGraph, &fold_ir_version,
+                              target_opset_version](onnx::ModelProto& model) {
+          std::shared_ptr<onnx::Graph> g(onnx::ImportModelProto(model));
+          if (g.get() == nullptr) {
+            // Same fallback as Optimizer::optimize(): if we can't parse the
+            // model, leave it untouched.
+            return;
+          }
+          // Convert the default ONNX domain's opset first, directly on the
+          // resident graph via ConvertVersionOnGraph -- so the simplification
+          // below can clean up any redundant nodes the version converter
+          // introduces, same rationale as the old ModelProto-level
+          // ConvertOpsetVersion call this replaces -- but without paying a
+          // second Import/Export pair for it (unlike ConvertOpsetVersion, which
+          // always does its own; still used by the `rewriter` branch above,
+          // which has no resident Graph to share this one with).
+          if (target_opset_version) {
+            onnxsim::ProfiledScope opset_scope("ConvertOpsetVersion");
+            onnx::version_conversion::ConvertVersionOnGraph(
+                g, *target_opset_version);
+          }
+          fold_ir_version = model.ir_version();
+          PipelineOnGraph(*g);
+          onnx::ModelProto out = onnx::PrepareOutput(model);
+          onnx::ExportModelProto(&out, g, /*consume_tensor_data=*/true);
+          // OptimizeGraphFixed never sees model-local functions (they live on
+          // ModelProto, not Graph), so carry them over unchanged -- mirroring
+          // Optimizer::optimize()'s own AddFunctionsToModel.
+          for (const auto& function_proto : model.functions()) {
+            *out.add_functions() = function_proto;
+          }
+          model = std::move(out);
+        });
   }
   // The fixed points mutate in place, so make one working copy of the (const)
-  // input model and simplify it in place.
-  onnx::ModelProto sim_model = model;
+  // input model and simplify it in place. When the caller has told us
+  // ``model``'s tensor data can be consumed (``mutable_model`` non-null), do
+  // the same move-based Import/Export round trip as OptAndShape's own
+  // resident Graph above, instead of a deep copy -- this is what actually
+  // avoids the extra ~1x-model-size peak documented in
+  // bench/RESULTS_synthetic_decoder_oom.md, since it was traced to exactly
+  // this copy, not (as first suspected) anything on the Python side.
+  onnx::ModelProto sim_model;
+  if (mutable_model != nullptr) {
+    std::shared_ptr<onnx::Graph> g(onnx::ImportModelProto(*mutable_model));
+    if (g.get() == nullptr) {
+      // Same fallback as the plain path: if we can't parse it, just copy.
+      sim_model = model;
+    } else {
+      sim_model = onnx::PrepareOutput(model);
+      onnx::ExportModelProto(&sim_model, g, /*consume_tensor_data=*/true);
+      for (const auto& function_proto : model.functions()) {
+        *sim_model.add_functions() = function_proto;
+      }
+    }
+  } else {
+    sim_model = model;
+  }
   // Matches onnx_simplifier.py's default (mutable_initializer=False): fold
   // initializers that also appear as graph inputs like any other constant.
   if (!mutable_initializer) {
@@ -664,9 +815,24 @@ onnx::ModelProto Simplify(
   }
   // Optionally convert the model to a different opset version (of the default
   // ONNX domain) first, so the simplification below can clean up any redundant
-  // nodes the version converter introduces.
-  if (target_opset_version) {
-    sim_model = ConvertOpsetVersion(sim_model, *target_opset_version);
+  // nodes the version converter introduces. Wrapped in its own profiled span --
+  // sibling to, not nested inside, the "Simplify" root below -- so its cost is
+  // visible in the flame graph / profile_pass_phases output instead of showing
+  // up as unaccounted time before the first pass.
+  //
+  // Only needed here for the `rewriter` branch, which is ModelProto-based
+  // throughout (onnxscript's rewriter only understands ModelProto) and so has
+  // no resident Graph to fold this into. The no-rewriter branch does the
+  // equivalent conversion itself, directly on its own resident Graph, inside
+  // Pipeline above -- see its ConvertVersionOnGraph call.
+  if (target_opset_version && rewriter) {
+    onnxsim::ProfiledScope opset_scope("ConvertOpsetVersion");
+    // std::move: sim_model is about to be overwritten by the result anyway,
+    // so let ConvertOpsetVersion's by-value parameter move-construct instead
+    // of copying -- required for it to reach ConvertVersion's non-copying
+    // overload (see model_prep.cpp).
+    sim_model =
+        ConvertOpsetVersion(std::move(sim_model), *target_opset_version);
   }
   {
     // A single root span so the profiled fixed points nest under one box in the
@@ -838,11 +1004,11 @@ onnx::ModelProto Simplify(
   const std::vector<std::string> assigned_node_names =
       AssignMissingNodeNames(sim_model);
   DropIncompleteValueInfo(sim_model);
-  RecordSimplifyOptionsMetadata(sim_model, skip_optimizers, constant_folding,
-                                shape_inference, tensor_size_threshold,
-                                target_opset_version, initializers_as_constants,
-                                include_inline_functions, mutable_initializer,
-                                overwrite_input_shapes, unused_output);
+  RecordSimplifyOptionsMetadata(
+      sim_model, skip_optimizers, constant_folding, shape_inference,
+      tensor_size_threshold, target_opset_version, initializers_as_constants,
+      include_inline_functions, mutable_initializer, overwrite_input_shapes,
+      unused_output, extra_optimizers);
   RecordSimplifyDiffMetadata(sim_model, model);
   // Nodes onnxsim itself had to name (no author-given name survived), and
   // functions inlined away (see the tally taken just before
@@ -864,6 +1030,44 @@ onnx::ModelProto Simplify(
   return sim_model;
 }
 
+onnx::ModelProto Simplify(
+    const ModelExecutor& executor, const onnx::ModelProto& model,
+    std::optional<std::vector<std::string>> skip_optimizers,
+    bool constant_folding, bool shape_inference, size_t tensor_size_threshold,
+    std::optional<int> target_opset_version, const GraphRewriter* rewriter,
+    bool initializers_as_constants, bool include_inline_functions,
+    bool mutable_initializer,
+    const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
+        overwrite_input_shapes,
+    const std::optional<std::vector<std::string>>& unused_output,
+    const std::optional<std::vector<std::string>>& extra_optimizers) {
+  return SimplifyImpl(executor, model, /*mutable_model=*/nullptr,
+                      skip_optimizers, constant_folding, shape_inference,
+                      tensor_size_threshold, target_opset_version, rewriter,
+                      initializers_as_constants, include_inline_functions,
+                      mutable_initializer, overwrite_input_shapes,
+                      unused_output, extra_optimizers);
+}
+
+onnx::ModelProto SimplifyConsumeInput(
+    const ModelExecutor& executor, onnx::ModelProto& model,
+    std::optional<std::vector<std::string>> skip_optimizers,
+    bool constant_folding, bool shape_inference, size_t tensor_size_threshold,
+    std::optional<int> target_opset_version, const GraphRewriter* rewriter,
+    bool initializers_as_constants, bool include_inline_functions,
+    bool mutable_initializer,
+    const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
+        overwrite_input_shapes,
+    const std::optional<std::vector<std::string>>& unused_output,
+    const std::optional<std::vector<std::string>>& extra_optimizers) {
+  return SimplifyImpl(executor, model, /*mutable_model=*/&model,
+                      skip_optimizers, constant_folding, shape_inference,
+                      tensor_size_threshold, target_opset_version, rewriter,
+                      initializers_as_constants, include_inline_functions,
+                      mutable_initializer, overwrite_input_shapes,
+                      unused_output, extra_optimizers);
+}
+
 void SimplifyPath(
     const ModelExecutor& executor, const std::string& in_path,
     const std::string& out_path,
@@ -874,7 +1078,8 @@ void SimplifyPath(
     bool mutable_initializer,
     const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
         overwrite_input_shapes,
-    const std::optional<std::vector<std::string>>& unused_output) {
+    const std::optional<std::vector<std::string>>& unused_output,
+    const std::optional<std::vector<std::string>>& extra_optimizers) {
   const bool debug_timing = std::getenv("ONNXSIM_DEBUG_PATH_TIMING") != nullptr;
   auto now = []() { return std::chrono::steady_clock::now(); };
   auto elapsed_ms = [](auto t0, auto t1) {
@@ -893,11 +1098,20 @@ void SimplifyPath(
 
   {
     const auto t0 = now();
-    model =
-        Simplify(executor, model, skip_optimizers, constant_folding,
-                 shape_inference, tensor_size_threshold, target_opset_version,
-                 rewriter, initializers_as_constants, include_inline_functions,
-                 mutable_initializer, overwrite_input_shapes, unused_output);
+    // ``model`` is this function's own local, about to be overwritten by the
+    // result and never read again beforehand -- exactly the case
+    // SimplifyConsumeInput's doc comment calls out as safe, and the one this
+    // investigation was written for (see
+    // bench/RESULTS_synthetic_decoder_oom.md): it avoids the ~1x-model-size
+    // deep copy ``Simplify()`` would otherwise make of ``model`` to get a
+    // mutable working copy, cutting the peak RSS of simplifying a large
+    // external-data model roughly in half.
+    model = SimplifyConsumeInput(
+        executor, model, skip_optimizers, constant_folding, shape_inference,
+        tensor_size_threshold, target_opset_version, rewriter,
+        initializers_as_constants, include_inline_functions,
+        mutable_initializer, overwrite_input_shapes, unused_output,
+        extra_optimizers);
     if (debug_timing) {
       std::cerr << "SimplifyPath: Simplify " << elapsed_ms(t0, now()) << "ms\n";
     }

@@ -11,13 +11,17 @@
  * representation during Simplify().
  *
  * The GGUF-specific thing worth calling out here is gguf_dtype.h's scope:
- * most of GGML's block-quantized types (Q4_0, every IQ*_ variant, ...) have
- * no ONNX raw-data equivalent at all, so ImportModelWithGGUF's
+ * most of GGML's block-quantized types (every IQ*_ variant, Q8_1, Q8_K, ...)
+ * have no ONNX raw-data equivalent at all, so ImportModelWithGGUF's
  * `skipped_out` matters more here than ImportModelWithSafetensors's
- * equivalent ever would in practice. The K-quant family this mapping DOES
- * cover (Q4_K/Q5_K/Q6_K/Q8_0 -- what a real quantized checkpoint, e.g.
- * Unsloth's GGUF exports, actually uses for the bulk of its weights) is
- * hydrated as ordinary float32, via HydrateTensorProtoFromGGUF's decode --
+ * equivalent ever would in practice. The families this mapping DOES cover
+ * -- K-quant (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0, what a real quantized
+ * checkpoint, e.g. Unsloth's GGUF exports, actually uses for the bulk of
+ * its weights), legacy (Q4_0/Q4_1/Q5_0/Q5_1, which llama.cpp's own mixed-
+ * precision quantizers still pick for particular tensor roles even in an
+ * otherwise K-quant checkpoint), and MXFP4 (gpt-oss's native MoE-expert
+ * quantization) -- are hydrated as ordinary float32, via
+ * HydrateTensorProtoFromGGUF's decode --
  * ImportModelWithGGUF is the intended way to pull a third-party GGUF
  * checkpoint's weight *values* into an ONNX graph you already have, by
  * initializer name (it needs no embedded onnxsim model, unlike
@@ -51,9 +55,11 @@ namespace tensor_pool {
 
 // GGUF counterpart of tensor_pool_bridge.h's HydrateTensorProto: same
 // contract (returns false, leaving `tensor` untouched, if `name` isn't
-// pooled) EXCEPT a K-quant-native entry (Q4_K/Q5_K/Q6_K/Q8_0 -- see
-// gguf_dtype.h's IsKQuant) is decoded to plain float32 raw_data instead of
-// copied verbatim, and `tensor`'s data_type is forced to FLOAT to match --
+// pooled) EXCEPT a K-quant-native, MXFP4-native, or legacy-quant-native
+// entry (Q4_K/Q5_K/Q6_K/Q8_0/MXFP4/Q4_0/Q4_1/Q5_0/Q5_1 -- see gguf_dtype.h's
+// IsKQuant/IsMxfp4/IsLegacyQuant) is decoded to plain float32 raw_data
+// instead of copied verbatim, and `tensor`'s data_type is forced to FLOAT
+// to match --
 // overriding whatever data_type the caller's initializer previously
 // declared, since the decoded values are only meaningful as float32 (the
 // caller's own declared dtype reflects whatever *their* graph expects,
@@ -68,10 +74,14 @@ inline bool HydrateTensorProtoFromGGUF(const std::string& name,
   if (entry == nullptr) return false;
 
   uint32_t ggml_type;
-  if (gguf::FromOnnx(entry->dtype, &ggml_type) && gguf::IsKQuant(ggml_type)) {
+  if (gguf::FromOnnx(entry->dtype, &ggml_type) &&
+      (gguf::IsKQuant(ggml_type) || gguf::IsMxfp4(ggml_type) ||
+       gguf::IsLegacyQuant(ggml_type))) {
     std::vector<float> floats;
     if (!pool.DequantizeToFloat(name, &floats)) {
-      return false;  // Unreachable: FromOnnx+IsKQuant already validated dtype.
+      // Unreachable: FromOnnx+IsKQuant/IsMxfp4/IsLegacyQuant already
+      // validated dtype.
+      return false;
     }
     tensor.set_data_location(onnx::TensorProto::DEFAULT);
     tensor.clear_external_data();
@@ -133,12 +143,12 @@ inline size_t ExportModelWithGGUF(
 }
 
 // Load `gguf_path` into `pool` and, for every graph initializer whose name
-// matches a pooled tensor -- a raw-dtype tensor, or a K-quant one (see
-// gguf_dtype.h's IsKQuant), either hydrate it in place (hydrate_all, the
-// default -- a K-quant match is decoded to float32, see
-// HydrateTensorProtoFromGGUF) or leave it as a lazy EXTERNAL reference
-// (hydrate_all=false; see tensor_pool_bridge.h's caveat on this mode --
-// note a K-quant match left lazy this way still needs
+// matches a pooled tensor -- a raw-dtype tensor, or a K-quant/MXFP4/legacy-
+// quant one (see gguf_dtype.h's IsKQuant/IsMxfp4/IsLegacyQuant), either
+// hydrate it in place (hydrate_all, the default -- such a match is decoded
+// to float32, see HydrateTensorProtoFromGGUF) or leave it as a lazy
+// EXTERNAL reference (hydrate_all=false; see tensor_pool_bridge.h's caveat
+// on this mode -- note a match left lazy this way still needs
 // HydrateTensorProtoFromGGUF, not the plain HydrateTensorProto that caveat
 // points to, when it's eventually hydrated on demand).
 // Returns the number of initializers matched (hydrated or marked lazy).
@@ -182,6 +192,48 @@ inline size_t ImportModelWithGGUF(
   return matched;
 }
 
+// Like ImportModelWithGGUF(hydrate_all=true), but instead of writing each
+// matched tensor's decoded bytes directly into `model`'s initializer (which
+// a caller crossing an FFI boundary would then have to pay a full
+// protobuf encode/decode of, on top of the copies below already make --
+// see AdoptAllWithPlaceholderOffsets's analogous external_tensor_bytes
+// design for the export direction), stashes them into a fresh `matched`
+// pool instead, keyed by initializer name, and clears the (now-superseded,
+// since it's about to be overwritten) old raw_data from the initializer in
+// `model` -- so a caller only has to serialize/return a byte-free `model`
+// plus `matched`, and fill each matched initializer in on its own side
+// (`matched.dtype(name)`/`matched.bytes(name)`; a K-quant entry decodes to
+// FLOAT here exactly as HydrateTensorProtoFromGGUF would, so the caller
+// never needs to know which matches were K-quant). Reuses
+// HydrateTensorProtoFromGGUF unchanged (via a throwaway `scratch` per
+// matched tensor) rather than duplicating its K-quant-vs-raw-dtype
+// decode logic. Returns the number of tensors matched (== `matched`.size()
+// once this returns); `skipped_out` has the same meaning as
+// ImportModelWithGGUF's.
+inline size_t ImportModelWithGGUFToPool(
+    onnx::ModelProto& model, const std::string& gguf_path, TensorPool& matched,
+    std::vector<std::string>* skipped_out = nullptr) {
+  TensorPool file_pool;
+  std::vector<std::string> skipped = file_pool.LoadGGUF(gguf_path);
+  if (skipped_out != nullptr) *skipped_out = std::move(skipped);
+
+  size_t n = 0;
+  for (auto& init : *model.mutable_graph()->mutable_initializer()) {
+    onnx::TensorProto scratch;
+    scratch.set_data_type(init.data_type());
+    *scratch.mutable_dims() = init.dims();
+    if (!HydrateTensorProtoFromGGUF(init.name(), scratch, file_pool)) continue;
+
+    std::vector<int64_t> shape(scratch.dims().begin(), scratch.dims().end());
+    std::unique_ptr<std::string> bytes(scratch.release_raw_data());
+    matched.Add(init.name(), scratch.data_type(), std::move(shape),
+                std::move(*bytes));
+    init.clear_raw_data();
+    ++n;
+  }
+  return n;
+}
+
 // GGUF counterparts of tensor_pool_bridge.h's SaveModelAsSafetensors /
 // LoadModelFromSafetensors -- see that header's top comment for the
 // self-describing-archive design (EmbedModel/ExtractModel, which these
@@ -217,8 +269,10 @@ inline bool LoadModelFromGGUF(const std::string& path, onnx::ModelProto* model,
 // written to disk exactly once despite the model blob needing two passes.
 inline void SaveModelAsGGUFStandalone(
     onnx::ModelProto& model, const std::string& path, TensorPool& pool,
-    const std::map<std::string, std::string>& string_metadata = {}) {
-  auto adopted = AdoptAllWithPlaceholderOffsets(model, path, pool);
+    const std::map<std::string, std::string>& string_metadata = {},
+    std::map<std::string, std::string>* external_tensor_bytes = nullptr) {
+  auto adopted =
+      AdoptAllWithPlaceholderOffsets(model, path, pool, external_tensor_bytes);
   CheckNoEmbeddedModelKeyCollision(pool);
 
   std::string placeholder_bytes;

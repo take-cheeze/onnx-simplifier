@@ -1,0 +1,605 @@
+name: Core ML Integration
+
+# End-to-end tests that convert onnxsim's output to Core ML using onnxsim's own
+# ONNX-to-MIL translator (tests/test_coreml_export.py, exercising
+# onnxsim/coreml_export.py and the --emit-coreml CLI flag). coremltools dropped its
+# own ONNX frontend in version 7 -- there's no off-the-shelf "convert this ONNX model"
+# call to lean on -- so this translator does the ONNX-op-to-MIL-op mapping itself and
+# only hands the result to coremltools' MIL-to-Core-ML backend.
+#
+# coremltools ships large platform-specific wheels and is not part of onnxsim's test
+# requirements, so this runs in its own workflow instead of the build-and-test matrix --
+# the same arrangement as the MLIR and ModelOpt integrations. Runs on PRs that touch the
+# Core ML export path or this harness, on a weekly schedule to catch new coremltools
+# releases, and on demand.
+#
+# Two test jobs, both against the same onnxsim wheel built once from the current tree:
+#
+# * `test-convert` (ubuntu): runs the full test_coreml_export.py suite. Converting an
+#   ONNX model to a MIL program / Core ML model needs no macOS-specific functionality
+#   (MIL construction and .mlpackage serialization are pure Python/protobuf), so this
+#   covers every op mapping and error path on a cheap, fast runner.
+# * `test-predict-macos` (macos-15): a stock macOS GitHub-hosted runner, which ships
+#   Core ML and Metal as part of the OS -- the only thing conversion alone can't cover.
+#   Converts a small model with skip_model_load=False and actually calls .predict() on
+#   it through the real Core ML runtime, then compares the result against onnxruntime,
+#   to catch anything that converts cleanly but Core ML itself rejects or computes
+#   differently.
+#
+# A third, separate job -- `export-benchmark-models` -- exercises
+# scripts/apple/prepare_benchmark_models.py against one real, multi-billion-parameter
+# gated model (meta-llama/Llama-3.2-1B-Instruct) using this repo's read-only HF_TOKEN
+# secret, the one thing a token-less local sandbox can't do (see that script's module
+# docstring). Like model-regression.yml's real-model sweep, this is multi-GB-download
+# heavy, so it runs on workflow_dispatch/schedule only, never on pull_request.
+#
+# A fourth job -- `benchmark-decode-macos` -- closes the loop those two only prepare
+# for: it exports each model in a small matrix and actually runs
+# scripts/apple/run_llm_decode_benchmark.py against it through the real Core ML
+# runtime on the macOS runner, the same two axes (decode tok/s, peak RSS)
+# DeviceMark's (https://devicemark.github.io/) on-device LLM leaderboard measures --
+# plus scripts/apple/check_decode_parity.py, which greedily generates the same
+# prompt through the original Hugging Face model (CPU) and reports how well the
+# two token sequences agree, to catch a translator bug that produces a model
+# Core ML happily runs but computes something wrong (see that script's module
+# docstring for why this is an agreement-rate check, not bit-exact). Every other
+# job in this workflow only checks that a graph *converts*; this is the one place
+# the decode benchmark and parity harnesses themselves actually execute anywhere,
+# since no environment developing this repo has a macOS/Core ML runtime to run
+# them in locally. The matrix spans multiple architecture families (Llama-style
+# via SmolLM2/Llama-3.2, Qwen2, Phi-3's fused qkv_proj/gate_up_proj) so a
+# translator regression specific to one doesn't hide behind another passing,
+# across both the smoke-test tier (SmolLM2-135M, plus --quantize-weights int8
+# and --matmul-to-conv variants of it -- see scripts/apple/README.md's
+# "Theoretical ceiling" and "matmul-to-conv1x1" sections for what those
+# measured; --matmul-to-conv stays off by default, measured slower not
+# faster here) and the few-billion-parameter tier -- the same rough weight
+# class as DeviceMark's own leaderboard (https://devicemark.github.io/,
+# roughly 0.8-5B; its own current roster is a different, non-overlapping
+# model list -- see bench/TODO_quality_retention_eval.md) -- SmolLM2-1.7B,
+# Qwen2.5-3B, Llama-3.2-1B/3B, Phi-3.5-mini. This is the one place any of
+# this actually executes anywhere, since no environment developing this repo
+# has real Core ML to run it on. Also workflow_dispatch/schedule-only,
+# matching the other real-model jobs.
+#
+# A fifth job -- `quality-eval-macos` -- is the first slice of
+# bench/TODO_quality_retention_eval.md's quality/retention plan: it runs small IFEval
+# and MATH-500 subsets (scripts/apple/run_quality_eval.py, an lm-evaluation-harness
+# wrapper) against both the float Hugging Face model (CPU, no macOS needed for that
+# half) and the exported Core ML model (scripts/apple/lm_eval_coreml_adapter.py, real
+# Core ML runtime), then scripts/apple/compute_retention.py reports the quantized/float
+# score ratio for each -- the third DeviceMark axis (https://devicemark.github.io/)
+# alongside decode speed and parity. Deliberately small (--limit, --max-gen-toks):
+# a prototype run of even a single MMLU-Pro example against this suite's unbatched
+# single-sequence decode took minutes on a small model on CPU (see that plan doc's
+# "Proposed scope" section) -- MMLU-Pro alone stays future work until that per-example
+# cost is addressed; MATH-500 was the cheap one (~7s/example prototyped), which is why
+# it's the second benchmark here, not MMLU-Pro. Also workflow_dispatch/schedule-only.
+
+on:
+  schedule:
+    - cron: "0 9 * * 1" # Weekly, Monday 09:00 UTC
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "onnxsim/coreml_export.py"
+      - "tests/test_coreml_export.py"
+      - ".github/workflows/coreml-integration.yml"
+      - "onnxsim/__init__.py"
+      - "onnxsim/onnx_simplifier.py"
+
+concurrency:
+  group: coreml-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Build onnxsim once from the current tree, exactly like the MLIR and ModelOpt
+  # integration workflows, and hand the wheel to the test jobs so they exercise this
+  # branch's code rather than a PyPI release.
+  build:
+    name: Build onnxsim wheel
+    runs-on: ubuntu-24.04
+    env:
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Build cp311 wheel
+        uses: pypa/cibuildwheel@v4.2.1
+        env:
+          CIBW_BUILD: "cp311-manylinux_x86_64"
+          CIBW_ARCHS: native
+          CIBW_BUILD_FRONTEND: "pip; args: --no-build-isolation"
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_ENVIRONMENT_PASS_LINUX: CI SCCACHE_GHA_ENABLED ACTIONS_RESULTS_URL ACTIONS_RUNTIME_TOKEN ACTIONS_CACHE_SERVICE_V2
+          CIBW_BEFORE_BUILD: "python3 -m pip install --break-system-packages cmake ninja setuptools sccache nanobind"
+          CIBW_ENVIRONMENT: CMAKE_ARGS="-DONNX_USE_PROTOBUF_SHARED_LIBS=OFF" CMAKE_GENERATOR=Ninja CMAKE_CXX_COMPILER_LAUNCHER=sccache CMAKE_LINKER_TYPE=LLD
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair -w {dest_dir} {wheel} --strip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: onnxsim-wheel-linux
+          path: ./wheelhouse/*.whl
+
+  build-macos:
+    name: Build onnxsim wheel (macOS arm64)
+    runs-on: macos-15
+    env:
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Build cp311 wheel
+        uses: pypa/cibuildwheel@v4.2.1
+        env:
+          CIBW_BUILD: "cp311-macosx_arm64"
+          CIBW_ARCHS: native
+          CIBW_BUILD_FRONTEND: "pip; args: --no-build-isolation"
+          CIBW_BEFORE_BUILD: "python3 -m pip install --break-system-packages cmake ninja setuptools sccache nanobind"
+          # Matches build-and-test.yml's macOS build: onnx 1.23+ uses std::to_chars
+          # in its text printer, which libc++ only exposes from macOS 13.3, so pin
+          # the same deployment target onnx itself ships its wheels with.
+          CIBW_ENVIRONMENT: MACOSX_DEPLOYMENT_TARGET=13.3 CMAKE_ARGS="-DONNX_USE_PROTOBUF_SHARED_LIBS=OFF" CMAKE_GENERATOR=Ninja CMAKE_CXX_COMPILER_LAUNCHER=sccache CMAKE_LINKER_TYPE=LLD
+      - uses: actions/upload-artifact@v7
+        with:
+          name: onnxsim-wheel-macos
+          path: ./wheelhouse/*.whl
+
+  test-convert:
+    name: Convert to Core ML (Linux)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-linux
+          path: wheelhouse
+      - name: Install onnxsim wheel + coremltools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest onnxruntime coremltools
+          python -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+      # Run from a neutral directory so the repo root's ./onnxsim source package
+      # (without the compiled extension) does not shadow the installed wheel.
+      - name: Run Core ML export tests
+        working-directory: ${{ runner.temp }}
+        run: pytest -v "$GITHUB_WORKSPACE/tests/test_coreml_export.py"
+
+  test-predict-macos:
+    name: Convert + predict with Core ML (macOS)
+    needs: build-macos
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-macos
+          path: wheelhouse
+      - name: Install onnxsim wheel + coremltools
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install onnxruntime coremltools numpy
+          python3 -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: python3 -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+      - name: Convert a small model and predict through the real Core ML runtime
+        working-directory: ${{ runner.temp }}
+        run: python3 "$GITHUB_WORKSPACE/scripts/apple/run_coreml_export_predict.py"
+
+  export-benchmark-models:
+    name: Export benchmark model suite (gated models via HF_TOKEN)
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # Read-only secret; lets scripts/apple/prepare_benchmark_models.py download
+      # meta-llama/Llama-3.2-*-Instruct, which needs an accepted license + an
+      # authenticated token even to fetch (see that script's module docstring).
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-linux
+          path: wheelhouse
+      - name: Install onnxsim wheel + LLM export deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "optimum-onnx" transformers coremltools onnxruntime
+          python -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+      - name: Export Llama-3.2-1B-Instruct (the smallest gated model in BENCHMARK_MODELS)
+        working-directory: ${{ runner.temp }}
+        run: |
+          python "$GITHUB_WORKSPACE/scripts/apple/prepare_benchmark_models.py" \
+            --only meta-llama/Llama-3.2-1B-Instruct \
+            --output-dir benchmark_models
+
+  benchmark-decode-macos:
+    name: Run LLM decode benchmark (macOS, real Core ML)
+    needs: build-macos
+    if: github.event_name != 'pull_request'
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # min_deployment_target is only forced for the two entries the
+          # "Compute-unit device placement" step below traces --
+          # MLComputePlan's per-operation computeDeviceUsage/estimatedCost
+          # APIs returned no data at all (every op) when the traced model
+          # was built at coremltools' own default target; iOS18 is the
+          # highest target coremltools exposes and comfortably clears the
+          # iOS17.4/macOS15.4 floor those APIs are documented to need. Left
+          # unset for every other entry -- it's irrelevant off this one
+          # tracing step, and int8/none already convert fine at whatever
+          # target onnxsim.export_coreml otherwise picks (see
+          # export_llm_to_coreml.py's module docstring).
+          - model_id: HuggingFaceTB/SmolLM2-135M-Instruct
+            slug: smollm2-135m
+            max_context_length: 512
+            dtype: fp32
+            quantize_weights: none
+            matmul_to_conv: "false"
+            min_deployment_target: iOS18
+            io_dtype: fp32
+          - model_id: Qwen/Qwen2.5-1.5B-Instruct
+            slug: qwen2.5-1.5b
+            max_context_length: 512
+            dtype: fp16
+            quantize_weights: none
+            matmul_to_conv: "false"
+            min_deployment_target: ""
+            io_dtype: fp32
+          # Same model/dtype as the first entry, weight-only int8 quantized --
+          # see scripts/apple/README.md's "Theoretical ceiling" section for why
+          # this is expected to raise decode tok/s (roughly halves DRAM bytes
+          # read per token, the bandwidth-bound bottleneck for decode) without
+          # touching compute precision. Runs decode parity too, so a quality
+          # regression from quantization shows up here, not just a speed number.
+          - model_id: HuggingFaceTB/SmolLM2-135M-Instruct
+            slug: smollm2-135m-int8
+            max_context_length: 512
+            dtype: fp32
+            quantize_weights: int8
+            matmul_to_conv: "false"
+            min_deployment_target: ""
+            io_dtype: fp32
+          # Same model/dtype as the first entry, --matmul-to-conv enabled --
+          # unlike the int8 entry above, this targets compute (not bandwidth):
+          # the M4 ANE's native matmul path measures well below its conv1x1
+          # path on the same hardware (see the README's "Theoretical ceiling"
+          # section). Measured on this pipeline's actual shapes (mostly
+          # single-token decode) as slower, not faster, than the matmul
+          # baseline (see the README's "matmul-to-conv1x1" section) -- kept
+          # here, and the flag stays opt-in/off by default, so a future
+          # change to the rewrite or a different model size can be checked
+          # against the same baseline without re-deriving this result.
+          - model_id: HuggingFaceTB/SmolLM2-135M-Instruct
+            slug: smollm2-135m-conv
+            max_context_length: 512
+            dtype: fp32
+            quantize_weights: none
+            matmul_to_conv: "true"
+            min_deployment_target: iOS18
+            io_dtype: fp32
+          # Both flags together -- measured worse than either alone: 2.26
+          # tok/s vs. 3.61 baseline, 4.64 int8-only, 3.04 conv-only (see the
+          # README's "matmul-to-conv1x1" section). Not the neutral
+          # composition the two flags' independent scopes (weight storage
+          # vs. which op consumes it) would suggest. Kept here as a
+          # regression check now that this is known, not because either
+          # flag is expected to be enabled together in practice.
+          - model_id: HuggingFaceTB/SmolLM2-135M-Instruct
+            slug: smollm2-135m-int8-conv
+            max_context_length: 512
+            dtype: fp32
+            quantize_weights: int8
+            matmul_to_conv: "true"
+            min_deployment_target: ""
+            io_dtype: fp32
+          # Same model/dtype as the first entry with an fp16 *model interface*
+          # -- neither a bandwidth lever on the weights nor a change to which
+          # ops run, but the removal of the fp32<->fp16 conversion Core ML
+          # otherwise does at the model boundary on every call. This pipeline
+          # pays that twice per decode step over the whole KV cache (in as
+          # past_key_values_*, out as present_*), the largest thing crossing
+          # the boundary; see the README's "fp16 model interface" section.
+          # Runs decode parity too: it should be unchanged from the baseline
+          # (the computation was already fp16 -- only whether the caller gets
+          # that value or an upcast copy of it differs), so a parity *drop*
+          # here would mean something other than the interface moved.
+          - model_id: HuggingFaceTB/SmolLM2-135M-Instruct
+            slug: smollm2-135m-io16
+            max_context_length: 512
+            dtype: fp32
+            quantize_weights: none
+            matmul_to_conv: "false"
+            min_deployment_target: ""
+            io_dtype: fp16
+          # int8 weights + fp16 interface: the two levers that measured (int8)
+          # or are expected (fp16 I/O) to help, together. Checked explicitly
+          # rather than assumed to compose -- the int8 + matmul-to-conv entry
+          # above is precisely the case where two independently-scoped flags
+          # did not compose neutrally.
+          - model_id: HuggingFaceTB/SmolLM2-135M-Instruct
+            slug: smollm2-135m-int8-io16
+            max_context_length: 512
+            dtype: fp32
+            quantize_weights: int8
+            matmul_to_conv: "false"
+            min_deployment_target: ""
+            io_dtype: fp16
+          # Few-billion-parameter tier -- DeviceMark's own leaderboard weight
+          # class (https://devicemark.github.io/, roughly 1-4B), and the
+          # entries prepare_benchmark_models.py's BENCHMARK_MODELS already
+          # lists but this job didn't yet run real decode benchmark/parity
+          # against. SmolLM2-1.7B and Llama-3.2-1B are already validated for
+          # export+convert; Qwen2.5-3B and Llama-3.2-3B previously OOM'd
+          # during ONNX export/trace in a 15GB-RAM dev sandbox (not a
+          # translator issue -- see BENCHMARK_MODELS' notes), so this is
+          # also the first real test of whether this runner's memory clears
+          # that bar. Phi-3.5-mini is a structurally different graph shape
+          # (fused qkv_proj/gate_up_proj projections) than the Llama/Qwen2
+          # entries above, so it's new translator coverage regardless of the
+          # speed number. The Llama-3.2 entries are gated -- HF_TOKEN below,
+          # same read-only secret export-benchmark-models already uses.
+          - model_id: HuggingFaceTB/SmolLM2-1.7B-Instruct
+            slug: smollm2-1.7b
+            max_context_length: 512
+            dtype: fp16
+            quantize_weights: none
+            matmul_to_conv: "false"
+            min_deployment_target: ""
+            io_dtype: fp32
+          - model_id: meta-llama/Llama-3.2-1B-Instruct
+            slug: llama-3.2-1b
+            max_context_length: 512
+            dtype: fp16
+            quantize_weights: none
+            matmul_to_conv: "false"
+            min_deployment_target: ""
+            io_dtype: fp32
+          - model_id: meta-llama/Llama-3.2-3B-Instruct
+            slug: llama-3.2-3b
+            max_context_length: 512
+            dtype: fp16
+            quantize_weights: none
+            matmul_to_conv: "false"
+            min_deployment_target: ""
+            io_dtype: fp32
+          - model_id: Qwen/Qwen2.5-3B-Instruct
+            slug: qwen2.5-3b
+            max_context_length: 512
+            dtype: fp16
+            quantize_weights: none
+            matmul_to_conv: "false"
+            min_deployment_target: ""
+            io_dtype: fp32
+          - model_id: microsoft/Phi-3.5-mini-instruct
+            slug: phi-3.5-mini
+            max_context_length: 512
+            dtype: fp16
+            quantize_weights: none
+            matmul_to_conv: "false"
+            min_deployment_target: ""
+            io_dtype: fp32
+    env:
+      # Read-only secret; only meta-llama/Llama-3.2-*-Instruct entries above
+      # need it (gated -- see prepare_benchmark_models.py's module
+      # docstring). Harmless to set for every matrix entry.
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-macos
+          path: wheelhouse
+      - name: Install onnxsim wheel + LLM export/benchmark deps
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install "optimum-onnx" transformers coremltools onnxruntime
+          python3 -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: python3 -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+      - name: Export ${{ matrix.model_id }}
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/apple/export_llm_to_coreml.py" \
+            ${{ matrix.model_id }} --dtype ${{ matrix.dtype }} \
+            --max-context-length ${{ matrix.max_context_length }} \
+            --quantize-weights ${{ matrix.quantize_weights }} \
+            ${{ matrix.matmul_to_conv == 'true' && '--matmul-to-conv' || '' }} \
+            --io-dtype ${{ matrix.io_dtype }} \
+            ${{ matrix.min_deployment_target != '' && format('--minimum-deployment-target {0}', matrix.min_deployment_target) || '' }} \
+            --output ${{ matrix.slug }}.mlpackage
+      - name: Run the decode benchmark through the real Core ML runtime
+        working-directory: ${{ runner.temp }}
+        run: |
+          {
+            echo "### Decode benchmark: ${{ matrix.model_id }}"
+            echo '```'
+            python3 "$GITHUB_WORKSPACE/scripts/apple/run_llm_decode_benchmark.py" \
+              ${{ matrix.slug }}.mlpackage --prompt "The capital of France is" \
+              --max-new-tokens 20
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Check decode parity against the Hugging Face reference model
+        working-directory: ${{ runner.temp }}
+        run: |
+          {
+            echo "### Decode parity: ${{ matrix.model_id }}"
+            echo '```'
+            python3 "$GITHUB_WORKSPACE/scripts/apple/check_decode_parity.py" \
+              ${{ matrix.model_id }} ${{ matrix.slug }}.mlpackage \
+              --prompt "The capital of France is" --max-new-tokens 20
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      # Only the plain-matmul vs. matmul-to-conv baseline pair -- this step
+      # exists to answer one specific question (does --matmul-to-conv
+      # actually move ops onto a different Core ML compute unit, or did its
+      # measured slowdown happen on the same unit as the matmul baseline --
+      # see scripts/apple/README.md's "matmul-to-conv1x1" section), not to
+      # profile every matrix entry.
+      - name: Compute-unit device placement (MLComputePlan)
+        if: matrix.slug == 'smollm2-135m' || matrix.slug == 'smollm2-135m-conv'
+        working-directory: ${{ runner.temp }}
+        run: |
+          clang -O2 -o coreml_compute_plan_trace \
+            "$GITHUB_WORKSPACE/scripts/apple/coreml_compute_plan_trace.m" \
+            -framework CoreML -framework Foundation
+          mkdir -p compiled
+          xcrun coremlcompiler compile ${{ matrix.slug }}.mlpackage compiled
+          mlmodelc=$(find compiled -maxdepth 1 -name '*.mlmodelc')
+          {
+            echo "### Compute-unit placement: ${{ matrix.model_id }} (${{ matrix.slug }})"
+            echo '```'
+            ./coreml_compute_plan_trace "$mlmodelc" ${{ matrix.slug }}-compute-plan.json
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Upload compute-plan trace
+        if: matrix.slug == 'smollm2-135m' || matrix.slug == 'smollm2-135m-conv'
+        uses: actions/upload-artifact@v7
+        with:
+          name: compute-plan-${{ matrix.slug }}
+          path: ${{ runner.temp }}/${{ matrix.slug }}-compute-plan.json
+
+  quality-eval-macos:
+    name: Run quality/retention eval (macOS, real Core ML)
+    needs: build-macos
+    if: github.event_name != 'pull_request'
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      MODEL_ID: HuggingFaceTB/SmolLM2-135M-Instruct
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-macos
+          path: wheelhouse
+      - name: Install onnxsim wheel + LLM export/eval deps
+        run: |
+          python3 -m pip install --upgrade pip
+          # sympy: hendrycks_math500's answer scorer (lm_eval/tasks/hendrycks_math/utils.py)
+          # imports it directly for symbolic equivalence checking (e.g. 1/2 == 0.5) --
+          # not one of lm-eval's own declared dependencies, so it's listed explicitly
+          # rather than relying on optimum-onnx's torch pulling it in transitively.
+          python3 -m pip install "optimum-onnx" transformers accelerate coremltools onnxruntime sympy "lm-eval[ifeval]"
+          python3 -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: python3 -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+      - name: Export ${{ env.MODEL_ID }}
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/apple/export_llm_to_coreml.py" \
+            "$MODEL_ID" --max-context-length 512 --output model.mlpackage
+      - name: Evaluate the float (Hugging Face) model on a small IFEval subset
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/apple/run_quality_eval.py" \
+            --model hf --model-args "pretrained=$MODEL_ID,dtype=float32" \
+            --tasks ifeval --limit 10 --max-gen-toks 128 --apply-chat-template \
+            --output float_ifeval.json
+      - name: Evaluate the quantized (Core ML) model on the same subset
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/apple/run_quality_eval.py" \
+            --model coreml --model-args "pretrained=model.mlpackage" \
+            --tasks ifeval --limit 10 --max-gen-toks 128 --apply-chat-template \
+            --output coreml_ifeval.json
+      - name: Compute quantized/float retention (IFEval)
+        working-directory: ${{ runner.temp }}
+        run: |
+          {
+            echo "### Quality/retention: $MODEL_ID (IFEval, --limit 10 -- not benchmark-grade)"
+            echo '```'
+            python3 "$GITHUB_WORKSPACE/scripts/apple/compute_retention.py" \
+              float_ifeval.json coreml_ifeval.json \
+              --model-id "$MODEL_ID" --output retention_ifeval.json
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      # hendrycks_math500 (MATH-500 -- same HuggingFaceH4/MATH-500 source DeviceMark's
+      # own battery draws from, see bench/TODO_quality_retention_eval.md) is the second
+      # benchmark this suite runs in CI, not MMLU-Pro: prototyping found it far cheaper
+      # per example at this suite's unbatched single-sequence decode (~7s/example on
+      # CPU at --limit 3, vs. MMLU-Pro's ~2 minutes/example -- see that doc's "What's
+      # been prototyped" section) since its task YAML has no large default
+      # max_gen_toks. --max-gen-toks 256 here (vs. IFEval's 128) gives a little more
+      # room for the "show your work, then \boxed{}" answer format MATH problems use.
+      - name: Evaluate the float (Hugging Face) model on a small MATH-500 subset
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/apple/run_quality_eval.py" \
+            --model hf --model-args "pretrained=$MODEL_ID,dtype=float32" \
+            --tasks hendrycks_math500 --limit 10 --max-gen-toks 256 --apply-chat-template \
+            --output float_math500.json
+      - name: Evaluate the quantized (Core ML) model on the same subset
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/apple/run_quality_eval.py" \
+            --model coreml --model-args "pretrained=model.mlpackage" \
+            --tasks hendrycks_math500 --limit 10 --max-gen-toks 256 --apply-chat-template \
+            --output coreml_math500.json
+      - name: Compute quantized/float retention (MATH-500)
+        working-directory: ${{ runner.temp }}
+        run: |
+          {
+            echo "### Quality/retention: $MODEL_ID (MATH-500, --limit 10 -- not benchmark-grade)"
+            echo '```'
+            python3 "$GITHUB_WORKSPACE/scripts/apple/compute_retention.py" \
+              float_math500.json coreml_math500.json \
+              --model-id "$MODEL_ID" --output retention_math500.json
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      # Machine-readable trend data (bench/TODO_quality_retention_eval.md's
+      # "Reporting" section): each retention_*.json has a flat "records" list
+      # ({model_id, benchmark, metric, subset_n, float_acc, quantized_acc,
+      # retention}, see compute_retention.py's build_records) alongside the
+      # nested summary already printed above -- lets a later run accumulate
+      # these into a trend table without re-parsing $GITHUB_STEP_SUMMARY text.
+      - name: Upload quality/retention results
+        uses: actions/upload-artifact@v7
+        with:
+          name: quality-retention-results
+          path: |
+            ${{ runner.temp }}/retention_ifeval.json
+            ${{ runner.temp }}/retention_math500.json

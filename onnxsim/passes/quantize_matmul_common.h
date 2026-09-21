@@ -11,7 +11,9 @@
 // INT8 per output channel from its static values; they differ only in how
 // the *activation* is quantized (a runtime-computed DynamicQuantizeLinear vs.
 // a calibrated, fixed QuantizeLinear/DequantizeLinear pair) and, downstream
-// of that, in the rest of the graph they build.
+// of that, in the rest of the graph they build. ReadInt8Matrix is also used
+// by defuse_matmul_integer_to_float.h, which reads back a weight one of
+// these passes quantized.
 
 #pragma once
 
@@ -110,6 +112,28 @@ inline std::vector<float> ReadFloatMatrix(const Tensor& w_t) {
     return ReadRawDataHostOrder<float>(w_t.data<float>(), numel);
   }
   return w_t.floats();
+}
+
+// Reads `q_t` (a 2-D INT8 constant) into a flat row-major vector<int8_t>,
+// regardless of whether it is stored as raw bytes (int8_t has no
+// byte-order concerns, but this still goes through ReadRawDataHostOrder for
+// consistency with every other raw_data read site -- see endian_read.h) or
+// ONNX's typed field for sub-32-bit integer types, which is int32_data (a
+// signed 8-bit code always round-trips through it unchanged).
+inline std::vector<int8_t> ReadInt8Matrix(const Tensor& q_t) {
+  const auto& sizes = q_t.sizes();
+  const int64_t numel = sizes[0] * sizes[1];
+  if (q_t.is_raw_data()) {
+    return ReadRawDataHostOrder<int8_t>(
+        reinterpret_cast<const int8_t*>(q_t.raw().data()), numel);
+  }
+  const std::vector<int32_t>& codes = q_t.int32s();
+  std::vector<int8_t> out(static_cast<size_t>(numel));
+  for (int64_t i = 0; i < numel; ++i) {
+    out[static_cast<size_t>(i)] =
+        static_cast<int8_t>(codes[static_cast<size_t>(i)]);
+  }
+  return out;
 }
 
 // Quantizes `w_t` (a 2-D float32 constant, laid out as [N, K] when
@@ -212,6 +236,25 @@ inline void QuantizeWeightPerChannelInPlace(const Tensor& w_t,
   scale_out.elem_type() = TensorProto_DataType_FLOAT;
   scale_out.sizes() = {C};
   scale_out.floats() = std::move(scale);
+}
+
+// An explicit per-channel INT8 zero-point (all zeros, shape [C]) for a
+// symmetric-quantized weight's DequantizeLinear.
+//
+// The zero_point input is optional per the ONNX spec (and symmetric
+// quantization is always 0), so the static-quantize passes used to omit it --
+// but runtimes that fuse the QDQ pattern into an integer kernel require scale
+// and zero_point to have the same shape: onnxruntime's QGemm fusion rejects
+// the fused MatMul+Add outright ("zero point and scale of input b should have
+// the same shape size"), and the VitisAI EP aborts while partitioning it.
+// Spelling out the zeros keeps the numerics identical and both runtimes happy.
+inline void MakeSymmetricInt8WeightZeroPoint(int64_t channels, Tensor& zp_out) {
+  zp_out.elem_type() = TensorProto_DataType_INT8;
+  zp_out.sizes() = {channels};
+  // raw_data, not int32s() -- see WriteRawDataLittleEndian's doc comment in
+  // endian_read.h for why.
+  zp_out.set_raw_data(WriteRawDataLittleEndian(
+      std::vector<int8_t>(static_cast<size_t>(channels), 0)));
 }
 
 // Same as QuantizeWeightPerChannelInPlace, but INT16 (max(|w[:, j]|) / 32767
@@ -439,6 +482,32 @@ inline bool TryQuantizeWeightBlockwiseInt4InPlace(const Tensor& w_t,
   scale_out.sizes() = {scale_dim0, scale_dim1};
   scale_out.floats() = std::move(scale);
   return true;
+}
+
+// Reads `w_t` (a 2-D float32 constant, [K, N] or, when `transposed`,
+// [N, K]) into a flat row-major [N, K] (output channel first) buffer --
+// matches TryQuantizeWeightBlockwiseInt4InPlace's own channel_axis
+// convention, used by callers (magnitude_pruning.h, quarot.h) that need the
+// weight in a fixed output-channel-first layout regardless of its own
+// on-disk transposed-or-not storage.
+inline std::vector<float> ReadWeightNK(const Tensor& w_t, bool transposed) {
+  const int64_t dim0 = w_t.sizes()[0];
+  const int64_t dim1 = w_t.sizes()[1];
+  const int64_t rows = transposed ? dim0 : dim1;
+  const int64_t cols = transposed ? dim1 : dim0;
+  const std::vector<float> data = ReadFloatMatrix(w_t);
+  std::vector<float> w_nk(static_cast<size_t>(rows * cols));
+  for (int64_t i = 0; i < dim0; ++i) {
+    for (int64_t j = 0; j < dim1; ++j) {
+      const float v = data[static_cast<size_t>(i * dim1 + j)];
+      if (transposed) {
+        w_nk[static_cast<size_t>(i * cols + j)] = v;
+      } else {
+        w_nk[static_cast<size_t>(j * cols + i)] = v;
+      }
+    }
+  }
+  return w_nk;
 }
 
 // Same block-wise scheme as TryQuantizeWeightBlockwiseInt4InPlace, but INT8

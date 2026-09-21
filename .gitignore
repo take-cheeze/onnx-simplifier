@@ -139,11 +139,48 @@ dmypy.json
 *.onnx
 *.onnx.data
 
+# Committed test fixtures, which the blanket *.onnx rule above would
+# otherwise drop silently -- scripts/convertmodel/test/step_*.onnx are step
+# graphs emitted by the library's own builders and checked in on purpose
+# (see make_step_graph_fixtures.py); regenerating them must not un-track
+# them, and a fixture missing from a fresh checkout fails CI rather than the
+# author's machine.
+!scripts/convertmodel/test/*.onnx
+
+# Same reasoning, one directory level down: webgpu_nas_search.test.mjs's own
+# fixtures (tools/onnx-finetune/scripts/generate_nas_step_graphs.py's output,
+# checked in rather than regenerated at test time -- see that test file's
+# own header comment for why).
+!scripts/convertmodel/test/nas_search_candidates/*.onnx
+
+# Same reasoning for the WASM knowledge-distillation demo's checked-in
+# assets (see examples/llm_distillation/wasm_demo/generate_web_artifacts.py):
+# index.html fetches these small, tiny-architecture files directly, with no
+# build/generation step at request time, so they must not be silently
+# dropped by the blanket *.onnx rule above.
+!examples/llm_distillation/wasm_demo/assets/*.onnx
+
+# Tiny (34KB) unsimplified nanochat export, committed so it can be dropped
+# straight into the browser wasm UI's file picker -- see scripts/nanochat/README.md.
+# The same file also lives under scripts/convertmodel/, served same-origin
+# for the "Load nanochat demo model" button (nanochat_demo.mjs) on the
+# deployed converter page.
+!scripts/nanochat/nanochat_wasm_demo.onnx
+!scripts/convertmodel/nanochat_wasm_demo.onnx
+
 compile_commands.json
 temp*.py
 test*.py
-# ...but the real test suite under tests/ is tracked.
+# ...but the real test suites under tests/ and tools/onnx-finetune/tests/ are
+# tracked.
 !tests/test*.py
+!tools/onnx-finetune/tests/test*.py
+!tools/onnx-cardputer-flash/tests/test*.py
+!tools/onnx-k210-flash/tests/test*.py
+
+# nncase's own compile-time report, written to the CWD it's invoked from
+# (tools/onnx-k210-flash/scripts/onnx_to_kmodel.py) -- not an output we produce.
+kmodel_info.txt
 
 .setuptools-cmake-build/
 onnxsim/version.py
@@ -196,3 +233,14 @@ node_modules/
 /npm/onnxsim/onnxsim.cjs
 /npm/onnxsim/onnxsim.wasm
 /npm/onnxsim/ort_executor.mjs
+
+# Claude Code local session/tooling state (e.g. background-agent worktree
+# checkouts under .claude/worktrees/) -- never part of the repo itself.
+/.claude/
+scripts/axera/vm/share/
+tiny-random-mistral/
+
+# PlatformIO build output for the Cardputer/K210 firmware runtimes -- local
+# toolchain/library downloads and object files, not part of the repo.
+tools/onnx-cardputer-flash/firmware/runtime/.pio/
+tools/onnx-k210-flash/firmware/runtime/.pio/

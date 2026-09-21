@@ -41,6 +41,12 @@ option(ONNXSIM_C_API "Build the C ABI shared library used by the Rust wrapper an
 option(ONNXSIM_COVERAGE "Instrument onnxsim's own C++ targets for gcov/llvm-cov coverage" OFF)
 option(ONNXSIM_TESTS "Build the dependency-free C++ unit tests (e.g. sym_expr)" OFF)
 option(ONNXSIM_WASM_ORT_WEB "For the Emscripten build: delegate constant folding to the page's onnxruntime-web instead of compiling and linking ONNX Runtime into the module" OFF)
+# Opt-in additional ModelExecutor backend (see onnxsim/xnnpack_executor.h and
+# docs/dlpack-executor.md): runs constant-folding fold groups through Google's
+# XNNPACK instead of ONNX Runtime, for a small, explicitly-supported subset of
+# ops. Independent of ONNXSIM_BUILTIN_ORT -- both may be built at once; the
+# caller picks which GetXxxModelExecutor() to hand to Simplify.
+option(ONNXSIM_BUILTIN_XNNPACK "Build and link Google's XNNPACK as an additional (opt-in) ModelExecutor backend for constant folding" OFF)
 
 if (ONNXSIM_WASM_ORT_WEB)
   # The whole point of this mode is to NOT bundle ONNX Runtime -- constant
@@ -111,6 +117,14 @@ if (ONNXSIM_BUILTIN_ORT)
   set(ORT_NAME onnxruntime)
 endif()
 
+if (ONNXSIM_BUILTIN_XNNPACK)
+  if (EMSCRIPTEN)
+    message(FATAL_ERROR "ONNXSIM_BUILTIN_XNNPACK is not supported for the "
+                        "Emscripten/WebAssembly build")
+  endif()
+  include(cmake/build_xnnpack.cmake)
+endif()
+
 # onnxsim's own onnx/onnx-optimizer fork provides the `onnx` target -- used for
 # every build (onnxsim's own Graph-native optimizer/shape-inference fixed
 # point needs onnxsim-fork-only extensions, e.g. onnx/common/
@@ -155,7 +169,7 @@ set(ONNXSIM_BLAKE3_COMPILE_DEFS
     BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512
     BLAKE3_USE_NEON=0)
 
-add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/constant_folding.cpp onnxsim/partial_shape_eval.cpp onnxsim/model_prep.cpp onnxsim/quantize_entry.cpp onnxsim/cross_layer_equalization_entry.cpp onnxsim/contrib_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/precision_estimator.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp onnxsim/tensor_pool_hash.cpp ${ONNXSIM_BLAKE3_SOURCES})
+add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/constant_folding.cpp onnxsim/partial_shape_eval.cpp onnxsim/model_prep.cpp onnxsim/quantize_entry.cpp onnxsim/cross_layer_equalization_entry.cpp onnxsim/pruning_entry.cpp onnxsim/structured_pruning_entry.cpp onnxsim/imatrix_quant_entry.cpp onnxsim/llm_int8_entry.cpp onnxsim/spqr_entry.cpp onnxsim/pb_llm_entry.cpp onnxsim/squeezellm_entry.cpp onnxsim/billm_entry.cpp onnxsim/kv_cache_quantization_entry.cpp onnxsim/owq_entry.cpp onnxsim/gear_entry.cpp onnxsim/rotatekv_entry.cpp onnxsim/awq_entry.cpp onnxsim/gptq_entry.cpp onnxsim/quarot_gptq_entry.cpp onnxsim/gptvq_entry.cpp onnxsim/qronos_entry.cpp onnxsim/daq_entry.cpp onnxsim/embedding_quantization_entry.cpp onnxsim/low_rank_compensation_entry.cpp onnxsim/lqer_entry.cpp onnxsim/norm_tweaking_entry.cpp onnxsim/dac_entry.cpp onnxsim/tesseraq_entry.cpp onnxsim/adaround_entry.cpp onnxsim/outlier_suppression_entry.cpp onnxsim/outlier_suppression_plus_entry.cpp onnxsim/smoothquant_entry.cpp onnxsim/rptq_entry.cpp onnxsim/spinquant_entry.cpp onnxsim/paroquant_entry.cpp onnxsim/gptaq_entry.cpp onnxsim/easyquant_entry.cpp onnxsim/fptq_entry.cpp onnxsim/duquant_entry.cpp onnxsim/svdquant_entry.cpp onnxsim/quantease_entry.cpp onnxsim/adaquant_entry.cpp onnxsim/slim_llm_entry.cpp onnxsim/moequant_entry.cpp onnxsim/bias_correction_entry.cpp onnxsim/contrib_schemas.cpp onnxsim/bev_custom_op_schemas.cpp onnxsim/qonnx_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/memory_planning.cpp onnxsim/xnnpack_codegen.cpp onnxsim/precision_estimator.cpp onnxsim/qat_graph_builder.cpp onnxsim/graph_grad.cpp onnxsim/qat_entry.cpp onnxsim/lora_entry.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp onnxsim/tensor_pool_hash.cpp onnxsim/gemm_fusion_backend.cpp onnxsim/omniquant_entry.cpp onnxsim/affinequant_entry.cpp onnxsim/brecq_entry.cpp onnxsim/mixed_precision_entry.cpp onnxsim/smooth_attention_entry.cpp onnxsim/ptq4vit_entry.cpp onnxsim/autoround_entry.cpp onnxsim/flexround_entry.cpp onnxsim/foem_entry.cpp onnxsim/llm_fp4_activation_entry.cpp onnxsim/bwa_ptq_entry.cpp onnxsim/finetune_entry.cpp ${ONNXSIM_BLAKE3_SOURCES})
 target_compile_definitions(onnxsim PRIVATE ${ONNXSIM_BLAKE3_COMPILE_DEFS})
 if (ONNXSIM_BUILTIN_ORT)
   # Both ways of obtaining ONNX Runtime ship/install headers flat under this
@@ -163,6 +177,24 @@ if (ONNXSIM_BUILTIN_ORT)
   # `cmake --install` of the ExternalProject build -- see that file), so
   # onnxsim.cpp/dlpack_bridge.h include onnxruntime_cxx_api.h directly.
   target_include_directories(onnxsim PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
+endif()
+if (ONNXSIM_BUILTIN_XNNPACK)
+  # onnx_to_xnnpack_subgraph.cpp / xnnpack_executor.cpp include xnnpack.h
+  # directly; the XNNPACK CMake target itself (linked below) already exports
+  # this include directory to its own sources but not to onnxsim's.
+  target_sources(onnxsim PRIVATE onnxsim/onnx_to_xnnpack_subgraph.cpp
+                                 onnxsim/xnnpack_executor.cpp)
+  target_include_directories(onnxsim PRIVATE ${XNNPACK_INCLUDE_DIR})
+  # The actual `target_link_libraries(onnxsim ... XNNPACK)` call is further
+  # below, alongside onnx/onnx_optimizer/ORT_NAME: CMake requires every
+  # target_link_libraries call for a given target to use the same
+  # keyword/plain signature, and those existing calls are plain (no
+  # PUBLIC/PRIVATE/INTERFACE), so this one must be too rather than introduced
+  # here as its own PRIVATE call.
+  # Guards the xnnpack.h-facing glue (onnx_to_xnnpack_subgraph.h,
+  # GetXnnpackModelExecutor) the same way ONNXSIM_HAS_ORT guards the Ort::
+  # glue above.
+  target_compile_definitions(onnxsim PUBLIC ONNXSIM_HAS_XNNPACK)
 endif()
 target_include_directories(onnxsim PUBLIC onnxsim)
 # dlpack.h (at third_party/dlpack/dlpack.h) is the tensor-exchange type at the
@@ -191,6 +223,9 @@ else()
   target_link_libraries(onnxsim onnx_optimizer onnx Threads::Threads)
   if (ONNXSIM_BUILTIN_ORT)
     target_link_libraries(onnxsim ${ORT_NAME})
+  endif()
+  if (ONNXSIM_BUILTIN_XNNPACK)
+    target_link_libraries(onnxsim XNNPACK)
   endif()
 endif()
 
@@ -475,6 +510,14 @@ if (ONNXSIM_TESTS)
   target_include_directories(model_metrics_test PRIVATE onnxsim)
   add_test(NAME model_metrics_test COMMAND model_metrics_test)
 
+  # memory_planning builds on model_metrics' GraphView/liveness core, so it is
+  # likewise ONNX-free and tests standalone the same way.
+  add_executable(memory_planning_test onnxsim/memory_planning_test.cpp
+                                      onnxsim/memory_planning.cpp
+                                      onnxsim/model_metrics.cpp onnxsim/sym_expr.cpp)
+  target_include_directories(memory_planning_test PRIVATE onnxsim)
+  add_test(NAME memory_planning_test COMMAND memory_planning_test)
+
   # The M1 symbolic value evaluator (issue #532) is likewise dependency-free
   # (only SymExpr), so it builds and runs standalone -- including under
   # Emscripten -- without configuring ONNX / onnxruntime.
@@ -543,6 +586,136 @@ if (ONNXSIM_TESTS)
   onnxsim_add_ort_rpath(precision_estimator_test)
   add_test(NAME precision_estimator_test COMMAND precision_estimator_test)
 
+  # graph_grad.{h,cpp} differentiates a slice of a forward graph into the
+  # GraphBuilder qat_graph_builder.{h,cpp} defines, and needs onnx for the
+  # NodeProtos it reads -- so it links the fully-configured `onnxsim` target
+  # like precision_estimator_test above. graph_grad.cpp itself is compiled
+  # into the `onnxsim` library (see the add_library above) rather than into
+  # this target, because qat_entry.cpp -- and through it the WASM binding
+  # onnxsim_qat_build_step_graph -- now calls it; this test gets it from the
+  # library, like GraphBuilder from qat_graph_builder.cpp.
+  add_executable(graph_grad_test onnxsim/graph_grad_test.cpp)
+  target_link_libraries(graph_grad_test onnxsim)
+  onnxsim_add_ort_rpath(graph_grad_test)
+  add_test(NAME graph_grad_test COMMAND graph_grad_test)
+
+  # BuildBackwardWithTemplatedRules, graph_grad.cpp's onnxscript-templated
+  # rules (see that file's "Templated rules" section), now wired into
+  # production Rules() for eleven op types. Needs the fully-configured
+  # `onnxsim` target for the same reason graph_grad_test does, plus
+  # onnx::inliner (already compiled into the `onnx` target, see
+  # third_party/onnx/onnx/inliner/CMakeLists.txt) for the inlining
+  # MakeStepGraph now does when a builder has accumulated functions.
+  add_executable(graph_grad_templates_test onnxsim/graph_grad_templates_test.cpp)
+  target_link_libraries(graph_grad_templates_test onnxsim)
+  onnxsim_add_ort_rpath(graph_grad_templates_test)
+  add_test(NAME graph_grad_templates_test COMMAND graph_grad_templates_test)
+
+  # Dev convenience only, never part of any default build target or CI job --
+  # the same shape as regenerate_moe_templates below, for the same reason:
+  # re-runs scripts/codegen/generate_grad_templates.py to refresh both
+  # onnxsim/graph_grad_templates_gen.py and .h in place. Both are checked
+  # into the repository specifically so ordinary builds -- including every
+  # cross-compile matrix (Windows/macOS/ARM, WASM/Pyodide, s390x) and, on the
+  # Python side, the wheel build itself (setup.py's own ONNXSIM_BUILTIN_ORT=OFF
+  # already keeps that build lean; it never installs onnxscript either) --
+  # never need onnxscript, which this script (like
+  # generate_moe_function_templates.py) depends on; see that script's own
+  # module docstring. Run explicitly with `cmake --build . --target
+  # regenerate_grad_templates` when iterating on a templated gradient rule
+  # itself, in any development environment that happens to have a Python3
+  # interpreter (onnxscript still needs installing separately) -- this target
+  # simply does not exist otherwise, so a Python-less C++-only build tree
+  # never sees it.
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    add_custom_target(regenerate_grad_templates
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/scripts/codegen/generate_grad_templates.py
+              ${CMAKE_CURRENT_SOURCE_DIR}/onnxsim/graph_grad_templates_gen.py
+              ${CMAKE_CURRENT_SOURCE_DIR}/onnxsim/graph_grad_templates_gen.h
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      COMMENT "Regenerating graph_grad_templates_gen.{py,h} from onnxscript"
+      VERBATIM)
+  endif()
+
+  # xnnpack_codegen.{h,cpp} needs onnx (ModelProto/shape inference), like
+  # precision_estimator_test above -- links the fully-configured `onnxsim`
+  # target rather than building standalone. Needs no XNNPACK build itself
+  # (ONNXSIM_BUILTIN_XNNPACK): it only emits text naming XNNPACK's C API.
+  add_executable(xnnpack_codegen_test onnxsim/xnnpack_codegen_test.cpp)
+  target_link_libraries(xnnpack_codegen_test onnxsim)
+  onnxsim_add_ort_rpath(xnnpack_codegen_test)
+  add_test(NAME xnnpack_codegen_test COMMAND xnnpack_codegen_test)
+
+  # qat_graph_builder.{h,cpp} builds onnx::ModelProto/NodeProto directly, so
+  # its test links the fully-configured `onnxsim` target like
+  # precision_estimator_test above -- and it calls onnx::checker on the step
+  # graph it emits, which needs the same.
+  add_executable(qat_graph_builder_test onnxsim/qat_graph_builder_test.cpp)
+  target_link_libraries(qat_graph_builder_test onnxsim)
+  onnxsim_add_ort_rpath(qat_graph_builder_test)
+  add_test(NAME qat_graph_builder_test COMMAND qat_graph_builder_test)
+
+  # qat_entry.{h,cpp} builds a whole QAT step graph out of two models, so its
+  # test needs onnx's shape inference and onnx::checker as well as the
+  # emitter -- all of which come from the fully-configured `onnxsim` target,
+  # like qat_graph_builder_test above.
+  add_executable(qat_entry_test onnxsim/qat_entry_test.cpp)
+  target_link_libraries(qat_entry_test onnxsim)
+  onnxsim_add_ort_rpath(qat_entry_test)
+  add_test(NAME qat_entry_test COMMAND qat_entry_test)
+
+  # lora_entry.{h,cpp} builds a LoRA/QLoRA step graph (and does the adapter
+  # injection qat_entry.{h,cpp} has no counterpart for -- see lora_entry.h's
+  # own comment on why), so its test needs onnx's shape inference and
+  # onnx::checker as well as the emitter -- all of which come from the
+  # fully-configured `onnxsim` target, like qat_entry_test above.
+  add_executable(lora_entry_test onnxsim/lora_entry_test.cpp)
+  target_link_libraries(lora_entry_test onnxsim)
+  onnxsim_add_ort_rpath(lora_entry_test)
+  add_test(NAME lora_entry_test COMMAND lora_entry_test)
+
+  # The Python<->C++ emitter parity check. It compares what qat_graph_builder.cpp
+  # emits against onnxsim/qat_parity_fixtures.txt, which is generated from
+  # onnxsim/qat_graph.py -- so the fixture path has to reach the source tree at
+  # runtime rather than the build tree, hence the compile definition.
+  add_executable(qat_graph_parity_test onnxsim/qat_graph_parity_test.cpp)
+  target_link_libraries(qat_graph_parity_test onnxsim)
+  target_compile_definitions(qat_graph_parity_test PRIVATE
+      QAT_PARITY_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/onnxsim/qat_parity_fixtures.txt")
+  onnxsim_add_ort_rpath(qat_graph_parity_test)
+  add_test(NAME qat_graph_parity_test COMMAND qat_graph_parity_test)
+
+  # contrib_schemas.cpp's MoE/QMoE registration needs onnx's schema
+  # registry and function-building API, like precision_estimator_test
+  # above -- links the fully-configured `onnxsim` target rather than
+  # building standalone.
+  add_executable(contrib_schemas_moe_test onnxsim/contrib_schemas_moe_test.cpp)
+  target_link_libraries(contrib_schemas_moe_test onnxsim)
+  onnxsim_add_ort_rpath(contrib_schemas_moe_test)
+  add_test(NAME contrib_schemas_moe_test COMMAND contrib_schemas_moe_test)
+
+  # Dev convenience only, never part of any default build target or CI job:
+  # re-runs scripts/codegen/generate_moe_function_templates.py to refresh
+  # onnxsim/contrib_schemas_moe_templates.gen.h in place. That header is
+  # checked into the repository specifically so ordinary builds -- including
+  # every cross-compile matrix (Windows/macOS/ARM, WASM/Pyodide, s390x) --
+  # never need onnxscript, which this script (unlike anything else the C++
+  # build touches) depends on; see that script's own module docstring. Run
+  # explicitly with `cmake --build . --target regenerate_moe_templates` when
+  # iterating on the MoE decomposition itself.
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    add_custom_target(regenerate_moe_templates
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/scripts/codegen/generate_moe_function_templates.py
+              ${CMAKE_CURRENT_SOURCE_DIR}/onnxsim/contrib_schemas_moe_templates.gen.h
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      COMMENT "Regenerating contrib_schemas_moe_templates.gen.h from onnxscript"
+      VERBATIM)
+  endif()
+
   # The ONNX<->GGML dtype mapping (gguf_dtype.h), mirroring
   # tensor_pool_dtype_test.cpp above for the same reason.
   add_executable(gguf_dtype_test onnxsim/gguf_dtype_test.cpp)
@@ -555,6 +728,20 @@ if (ONNXSIM_TESTS)
   target_include_directories(ggml_kquant_test PRIVATE onnxsim)
   add_test(NAME ggml_kquant_test COMMAND ggml_kquant_test)
 
+  # GGML MXFP4 dequantization (ggml_mxfp4.h) -- same standalone-buildable
+  # dependency footprint as ggml_kquant_test above.
+  add_executable(ggml_mxfp4_test onnxsim/ggml_mxfp4_test.cpp)
+  target_include_directories(ggml_mxfp4_test PRIVATE onnxsim)
+  add_test(NAME ggml_mxfp4_test COMMAND ggml_mxfp4_test)
+
+  # GGML legacy quant (Q4_0/Q4_1/Q5_0/Q5_1) dequantization
+  # (ggml_legacy_quant.h) -- same standalone-buildable dependency footprint
+  # as ggml_kquant_test above (it reuses that header's fp16 conversion, but
+  # still needs only gguf_dtype.h/ggml_kquant.h, no protobuf/onnx).
+  add_executable(ggml_legacy_quant_test onnxsim/ggml_legacy_quant_test.cpp)
+  target_include_directories(ggml_legacy_quant_test PRIVATE onnxsim)
+  add_test(NAME ggml_legacy_quant_test COMMAND ggml_legacy_quant_test)
+
   # TensorPool's GGUF read/write (tensor_pool_gguf.cpp) depends only on
   # tensor_pool.{h,cpp} and gguf_dtype.h, so it too builds and runs
   # standalone without ONNX / ONNX Runtime configured.
@@ -566,6 +753,17 @@ if (ONNXSIM_TESTS)
   target_include_directories(tensor_pool_gguf_test PRIVATE onnxsim third_party)
   target_compile_definitions(tensor_pool_gguf_test PRIVATE ${ONNXSIM_BLAKE3_COMPILE_DEFS})
   add_test(NAME tensor_pool_gguf_test COMMAND tensor_pool_gguf_test)
+
+  # ReadGGUFMetadata (tensor_pool_gguf.cpp) -- same standalone-buildable
+  # dependency footprint as tensor_pool_gguf_test above.
+  add_executable(read_gguf_metadata_test onnxsim/read_gguf_metadata_test.cpp
+                                         onnxsim/tensor_pool.cpp
+                                         onnxsim/tensor_pool_hash.cpp
+                                         onnxsim/tensor_pool_gguf.cpp
+                                         ${ONNXSIM_BLAKE3_SOURCES})
+  target_include_directories(read_gguf_metadata_test PRIVATE onnxsim third_party)
+  target_compile_definitions(read_gguf_metadata_test PRIVATE ${ONNXSIM_BLAKE3_COMPILE_DEFS})
+  add_test(NAME read_gguf_metadata_test COMMAND read_gguf_metadata_test)
 
   # tensor_pool_gguf_bridge.h needs onnx, same reason as
   # tensor_pool_bridge_test above.
@@ -585,4 +783,16 @@ if (ONNXSIM_TESTS)
   target_link_libraries(tensor_pool_archive_test onnxsim)
   onnxsim_add_ort_rpath(tensor_pool_archive_test)
   add_test(NAME tensor_pool_archive_test COMMAND tensor_pool_archive_test)
+
+  if (ONNXSIM_BUILTIN_XNNPACK)
+    # Exercises GetXnnpackModelExecutor() end to end (ONNX ModelProto in,
+    # DLManagedTensor out), so it links the fully-configured `onnxsim` target
+    # like the tests above, and additionally needs xnnpack.h for building its
+    # own input/expected-output tensors.
+    add_executable(xnnpack_executor_test onnxsim/xnnpack_executor_test.cpp)
+    target_link_libraries(xnnpack_executor_test onnxsim)
+    target_include_directories(xnnpack_executor_test PRIVATE ${XNNPACK_INCLUDE_DIR})
+    onnxsim_add_ort_rpath(xnnpack_executor_test)
+    add_test(NAME xnnpack_executor_test COMMAND xnnpack_executor_test)
+  endif()
 endif()

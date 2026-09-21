@@ -101,6 +101,17 @@ to the same target headers, together with:
 - `Python3_FIND_ABI`/`Python_FIND_ABI` set to `ANY;ANY;ANY;ANY`, to avoid a
   strict-ABI mismatch rejection between the host interpreter and the
   target's ABI tag.
+- `Python3_EXECUTABLE`/`Python_EXECUTABLE` must be an **absolute path**, not
+  a bare command name. A bare `python3` left CMake's own `find_program()`
+  free to re-resolve it -- which, only intermittently (same toolchain
+  versions, a fresh checkout/configure each time, no stale `CMakeCache.txt`
+  to blame), picked a different, wrong-architecture interpreter (the CI
+  runner's native `/bin/python`) for onnx-optimizer's generic
+  `find_package(Python ...)` call instead, failing the configure with
+  `Could NOT find Python ... Wrong architecture for the interpreter
+  "/bin/python"`. `build_wasm_pyodide.sh` resolves `PYTHON_EXECUTABLE` via
+  `command -v` before passing it to CMake so there is nothing left for
+  CMake to re-resolve.
 
 ### 3. nanobind 3.0.0's missing `<cstdio>` include
 
@@ -321,7 +332,7 @@ path, and calls `_list_optimizers()` to confirm it's genuinely
 functional.
 
 **Wired into the release flow, but as a best-effort addition, not a
-blocking one**: `build_wheel_pyodide` runs on `push`/`release`/
+blocking one**: `build_wheel_pyodide` runs on `push`/`release`/`schedule`/
 `workflow_dispatch` (not a plain `pull_request` -- the underlying wasm32
 build is already functionally validated per-PR by the separate,
 path-filtered `pyodide-wasm.yml`; this job's own job is producing the
@@ -333,10 +344,11 @@ It runs with `continue-on-error: true`: this is genuinely new, first-time-
 in-CI automation (previously validated only once, by hand, at a now-
 outdated ABI epoch -- 314.0.5/`2026_0`, before the epoch-matching fix
 above), so a failure here must not hold back the native wheels every
-existing user actually depends on. A push to `master` already exercises
+existing user actually depends on. The daily schedule already exercises
 the whole thing for real, safely, before it ever matters: `upload_pypi`
-publishes push builds to Test PyPI, not the real index, so this job's
-first few real runs are a genuine dry run, not a live release gate.
+publishes scheduled (and manually dispatched) builds to Test PyPI, not the
+real index, so this job's first few real runs are a genuine dry run, not a
+live release gate.
 
 **Still an open question, not yet observed**: this is the first time this
 exact combination (`pyodide build` + the `ONNXSIM_WASM_SIDE_MODULE_RELINK`

@@ -1,5 +1,6 @@
-"""Tests for ``onnxsim.correct_bias`` (``onnxsim/bias_correction.py``) --
-AIMET's empirical Bias Correction.
+"""Tests for ``onnxsim.correct_bias`` and ``onnxsim.correct_spatial_bias``
+(``onnxsim/bias_correction.py``) -- AIMET's empirical Bias Correction, and
+its per-position generalization for spatially-structured errors.
 
 The most important test here isn't against a realistic quantized model --
 real per-channel symmetric weight quantization tends to round fairly
@@ -11,13 +12,22 @@ counterpart) fabricate a "quantized" model that is the float model with a
 ``correct_bias`` recovers it almost exactly -- a precise check of the
 measurement-and-graph-surgery mechanism itself, independent of whether any
 particular quantize_* scheme happens to leave a large enough bias to see.
+
+``correct_spatial_bias``'s tests instead center on *when it should and
+shouldn't act at all*: it only ever applies a correction that measurably
+helps on held-out data, so
+``test_correct_spatial_bias_recovers_structured_coordinate_mode_swap`` uses
+calibration data with real shared spatial structure (where a correction
+should help) while
+``test_correct_spatial_bias_is_a_noop_on_unstructured_calibration_data``
+uses independent random images (where none exists to find).
 """
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 from onnxsim import backend
@@ -25,8 +35,18 @@ from onnxsim import backend
 ort = pytest.importorskip("onnxruntime")
 
 
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+def _model(body, initializer=(), opset=13, ir_version=8):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -34,37 +54,29 @@ def _f32(array, name):
 
 
 def _gemm_model(w, b, K, N, batch=4):
-    nodes = [onnx.helper.make_node("Gemm", ["x", "w", "b"], ["y"])]
-    inits = [_f32(w, "w"), _f32(b, "b")]
-    graph = onnx.helper.make_graph(
-        nodes, "g", [_vi("x", [batch, K])], [_vi("y", [batch, N])], inits
+    return _model(
+        f"""
+        g (float[{batch},{K}] x) => (float[{batch},{N}] y)
+        {{
+          y = Gemm(x, w, b)
+        }}
+        """,
+        initializer=[_f32(w, "w"), _f32(b, "b")],
+        opset=17,
     )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 17)], ir_version=8
-    )
-    onnx.checker.check_model(model)
-    return model
 
 
 def _conv_model(w, b, c_in, c_out, batch=1, spatial=8):
-    nodes = [
-        onnx.helper.make_node(
-            "Conv", ["x", "w", "b"], ["y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
-        )
-    ]
-    inits = [_f32(w, "w"), _f32(b, "b")]
-    graph = onnx.helper.make_graph(
-        nodes,
-        "g",
-        [_vi("x", [batch, c_in, spatial, spatial])],
-        [_vi("y", [batch, c_out, spatial, spatial])],
-        inits,
+    return _model(
+        f"""
+        g (float[{batch},{c_in},{spatial},{spatial}] x) => (float[{batch},{c_out},{spatial},{spatial}] y)
+        {{
+          y = Conv<kernel_shape = [3, 3], pads = [1, 1, 1, 1]>(x, w, b)
+        }}
+        """,
+        initializer=[_f32(w, "w"), _f32(b, "b")],
+        opset=13,
     )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=8
-    )
-    onnx.checker.check_model(model)
-    return model
 
 
 def test_correct_bias_recovers_known_injected_gemm_bias():
@@ -95,6 +107,161 @@ def test_correct_bias_recovers_known_injected_gemm_bias():
     )
     assert after.worst_relative_l2 < before.worst_relative_l2 * 0.01
     assert after.worst_relative_l2 < 1e-5
+
+
+def _resize_model(mode, c=4, spatial=4, opset=19, ir_version=9):
+    scaled = spatial * 2
+    return _model(
+        f"""
+        g (float[1,{c},{spatial},{spatial}] x) => (float[1,{c},{scaled},{scaled}] y)
+        {{
+          scales = Constant<value = float[4] {{1.0, 1.0, 2.0, 2.0}}>()
+          y = Resize<mode = "{mode}">(x, , scales)
+        }}
+        """,
+        opset=opset,
+        ir_version=ir_version,
+    )
+
+
+def test_correct_bias_recovers_resize_mode_swap_bias():
+    # Not a quantization scenario: `swapped` is `float_model` with its
+    # Resize's interpolation mode changed (e.g. because a deployment
+    # accelerator doesn't implement "linear"), which -- like quantization
+    # rounding -- leaves a systematic per-channel mean shift that
+    # correct_bias should measure and cancel.
+    float_model = _resize_model("linear")
+    swapped = _resize_model("nearest")
+
+    rng = np.random.default_rng(10)
+    calib = [
+        {"x": rng.standard_normal((1, 4, 4, 4)).astype(np.float32)} for _ in range(16)
+    ]
+
+    corrected = onnxsim.correct_bias(float_model, swapped, calibration_data=calib)
+    onnx.checker.check_model(corrected)
+    assert [n.op_type for n in corrected.graph.node] == [
+        "Constant",
+        "Resize",
+        "Add",
+    ]
+
+    before = onnxsim.measure_accuracy_drop(float_model, swapped, calibration_data=calib)
+    after = onnxsim.measure_accuracy_drop(
+        float_model, corrected, calibration_data=calib
+    )
+    # A per-channel constant can't undo a genuinely different resampling
+    # algorithm, only its systematic (mean) component -- so this only
+    # checks that correction never makes the measured error worse, not
+    # that it drives it to zero the way the injected-bias tests do.
+    assert after.worst_relative_l2 <= before.worst_relative_l2 + 1e-9
+
+
+def _resize_coord_model(coord_mode, c=4, spatial=16, opset=19, ir_version=9):
+    scaled = spatial * 2
+    return _model(
+        f"""
+        g (float[1,{c},{spatial},{spatial}] x) => (float[1,{c},{scaled},{scaled}] y)
+        {{
+          scales = Constant<value = float[4] {{1.0, 1.0, 2.0, 2.0}}>()
+          y = Resize<mode = "linear", coordinate_transformation_mode = "{coord_mode}">(x, , scales)
+        }}
+        """,
+        opset=opset,
+        ir_version=ir_version,
+    )
+
+
+def _structured_batch(rng, c=4, spatial=16, noise_scale=0.3):
+    # A spatial pattern shared by every sample (as a fixed-mount camera's
+    # frames would share scene layout) plus per-sample noise on top --
+    # correct_spatial_bias only has a per-position pattern to find when
+    # calibration samples share spatial structure like this.
+    yy, xx = np.mgrid[0:spatial, 0:spatial].astype(np.float32)
+    base = np.stack([np.sin(xx / 3 + ch) + np.cos(yy / 4 - ch) for ch in range(c)])[
+        np.newaxis
+    ]
+    noise = rng.standard_normal((1, c, spatial, spatial)).astype(np.float32)
+    return {"x": (base + noise * noise_scale).astype(np.float32)}
+
+
+def test_correct_spatial_bias_recovers_structured_coordinate_mode_swap():
+    # coordinate_transformation_mode swaps (e.g. half_pixel -> asymmetric,
+    # a common accelerator-compatibility change) shift *where* each output
+    # pixel samples from, which correct_bias's per-channel constant cannot
+    # represent (see its module docstring). correct_spatial_bias's
+    # per-position grid can, but only picks up the part of that shift that
+    # recurs across calibration samples at the same position -- which is
+    # exactly what a shared spatial layout (e.g. a fixed-mount camera)
+    # gives it.
+    float_model = _resize_coord_model("half_pixel")
+    swapped = _resize_coord_model("asymmetric")
+
+    fit_rng = np.random.default_rng(11)
+    calib = [_structured_batch(fit_rng) for _ in range(64)]
+    held_out_rng = np.random.default_rng(12)
+    held_out = [_structured_batch(held_out_rng) for _ in range(64)]
+
+    corrected = onnxsim.correct_spatial_bias(
+        float_model, swapped, calibration_data=calib
+    )
+    onnx.checker.check_model(corrected)
+    assert "Add" in [n.op_type for n in corrected.graph.node]
+
+    before = onnxsim.measure_accuracy_drop(
+        float_model, swapped, calibration_data=held_out
+    )
+    after = onnxsim.measure_accuracy_drop(
+        float_model, corrected, calibration_data=held_out
+    )
+    # Real, substantial recovery on data the correction wasn't fit on --
+    # not just "no worse", the way a plain correct_bias check has to settle
+    # for on this same scenario.
+    assert after.worst_relative_l2 < before.worst_relative_l2 * 0.9
+
+
+def test_correct_spatial_bias_is_a_noop_on_unstructured_calibration_data():
+    # Independent random images share no spatial structure, so every
+    # position's mean error is expected to wash out to ~noise -- the
+    # held-out validation gate should reject the fitted correction rather
+    # than risk applying something that only fit noise.
+    float_model = _resize_coord_model("half_pixel")
+    swapped = _resize_coord_model("asymmetric")
+
+    rng = np.random.default_rng(13)
+    calib = [
+        {"x": rng.standard_normal((1, 4, 16, 16)).astype(np.float32)} for _ in range(64)
+    ]
+
+    corrected = onnxsim.correct_spatial_bias(
+        float_model, swapped, calibration_data=calib
+    )
+    assert [n.op_type for n in corrected.graph.node] == ["Constant", "Resize"]
+
+
+def test_correct_spatial_bias_is_a_noop_on_a_model_with_no_spatial_candidates():
+    # Gemm/MatMul have no spatial (height/width) axes for a position-wise
+    # grid to live on -- correct_spatial_bias only ever targets Conv/Resize.
+    rng = np.random.default_rng(14)
+    K, N = 8, 4
+    w = rng.standard_normal((K, N)).astype(np.float32)
+    b = rng.standard_normal(N).astype(np.float32)
+    model = _gemm_model(w, b, K, N)
+
+    calib = [{"x": rng.standard_normal((4, K)).astype(np.float32)} for _ in range(8)]
+    corrected = onnxsim.correct_spatial_bias(model, model, calibration_data=calib)
+    assert [n.op_type for n in corrected.graph.node] == ["Gemm"]
+
+
+def test_correct_spatial_bias_skips_correction_with_too_little_calibration_data():
+    float_model = _resize_coord_model("half_pixel")
+    swapped = _resize_coord_model("asymmetric")
+    calib = [{"x": np.zeros((1, 4, 16, 16), dtype=np.float32)}]  # only one batch
+
+    corrected = onnxsim.correct_spatial_bias(
+        float_model, swapped, calibration_data=calib
+    )
+    assert [n.op_type for n in corrected.graph.node] == ["Constant", "Resize"]
 
 
 def test_correct_bias_recovers_known_injected_conv_bias():
@@ -168,12 +335,13 @@ def test_correct_bias_is_a_noop_when_quantized_model_is_identical():
 
 
 def test_correct_bias_is_a_noop_on_a_model_with_no_candidate_ops():
-    x = _vi("x", [2, 4])
-    y = _vi("y", [2, 4])
-    node = onnx.helper.make_node("Relu", ["x"], ["y"])
-    graph = onnx.helper.make_graph([node], "g", [x], [y], [])
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=8
+    model = _model(
+        """
+        g (float[2,4] x) => (float[2,4] y)
+        {
+          y = Relu(x)
+        }
+        """
     )
 
     corrected = onnxsim.correct_bias(model, model)

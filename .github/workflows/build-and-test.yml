@@ -8,11 +8,24 @@ on:
   pull_request:
   release:
     types: [published]
-  # Lets build_wheel_pyodide (which otherwise only runs on push/release, see
-  # its own comment) be exercised against a PR branch before merge -- same
-  # rationale as pyodide-wasm.yml and static.yml's own workflow_dispatch
-  # triggers.
+  # Test PyPI publishing (see upload_pypi) no longer happens on every master
+  # push -- it's driven by this daily schedule instead, so master gets at
+  # most one Test PyPI upload per day (skipped entirely if master hasn't
+  # moved since the last scheduled run). Time is arbitrary/off-peak.
+  schedule:
+    - cron: '0 3 * * *'
+  # Two purposes: (1) lets build_wheel_pyodide (which otherwise only runs on
+  # push/release/schedule, see its own comment) be exercised against a PR
+  # branch before merge -- same rationale as pyodide-wasm.yml and static.yml's
+  # own workflow_dispatch triggers; (2) with publish_test_pypi=true, lets a
+  # human force an on-demand Test PyPI upload from master outside the daily
+  # schedule (see upload_pypi).
   workflow_dispatch:
+    inputs:
+      publish_test_pypi:
+        description: 'Publish this run''s build to Test PyPI (master only)'
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -28,9 +41,34 @@ jobs:
       # a master-branch push from a pull request inside the manylinux container.
       CIBW_ENVIRONMENT_PASS_LINUX: CI SCCACHE_GHA_ENABLED ACTIONS_RESULTS_URL ACTIONS_RUNTIME_TOKEN ACTIONS_CACHE_SERVICE_V2 ONNXSIM_RELEASE GITHUB_EVENT_NAME GITHUB_REF
       CIBW_BEFORE_BUILD: "python3 -m pip install --break-system-packages cmake ninja setuptools sccache nanobind"
-      CIBW_TEST_REQUIRES: pytest flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26 sympy onnxslim onnx_safetensors
+      # z3-solver is intentionally NOT installed on any of these per-platform/
+      # per-Python legs: tests/test_formal_verify_*.py's own shared helper
+      # (tests/_formal_verify_common.py) does `pytest.importorskip("z3")`, so
+      # without it those ~1000 Z3 proof tests are skipped here, not run --
+      # they'd otherwise re-run identically (same Z3 queries, same Python
+      # differential logic, no OS/arch/interpreter dependence) on every one of
+      # this matrix's legs, adding ~10 minutes to each for no additional
+      # coverage. They run exactly once instead, in the dedicated
+      # test_formal_verification job below (also why z3-solver's own missing
+      # linux/aarch64 wheel -- manylinux_2_38, newer glibc than this job's
+      # manylinux_2_28 image provides -- was never actually a concern for that
+      # job specifically: it doesn't install z3-solver at all).
+      CIBW_TEST_REQUIRES: pytest flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26 sympy onnx-shape-inference onnxslim onnx_safetensors
       CIBW_BEFORE_TEST: pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
-      CIBW_TEST_COMMAND: pytest -v ${{ matrix.pytest_args }} {project}/tests && onnxsim -h && onnxsim --list-default-optimizers
+      # The axera/quantization/pruning suites (tests/test_axera_*.py,
+      # tests/test_axelera_*.py, tests/test_pulsar2_*.py,
+      # tests/test_voyager_sdk_patterns.py, and every file whose name
+      # contains "quant"/"gguf"/"prun" -- see tests/conftest.py's
+      # pytest_collection_modifyitems for how the three markers below get
+      # applied) exercise onnxsim's own algorithm/format logic against
+      # onnx's reference evaluator or a committed fixture, not anything
+      # OS/arch/interpreter-dependent. Running hundreds of such tests
+      # identically on every one of this matrix's legs (2 OSes x up to 4
+      # Python versions) would just multiply CI cost with no additional
+      # coverage, so they're deselected here and instead run exactly once,
+      # in the dedicated test_axera_quantization_pruning job below (same
+      # rationale as test_formal_verification and its Z3 proof suite).
+      CIBW_TEST_COMMAND: pytest -v -m "not axera and not quantization and not pruning" ${{ matrix.pytest_args }} {project}/tests && onnxsim -h && onnxsim --list-default-optimizers
       # Only build on Python 3 and skip 32-bit or musl builds
       CIBW_SKIP: "*-win32 *-manylinux_i686 *-musllinux_*"
       # The extension is built RelWithDebInfo (see setup.py) so the sanitizer
@@ -54,19 +92,25 @@ jobs:
         # not natively here.
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
         # Full Python coverage on push/release; a reduced set on pull_request to
-        # cut CI jobs. cp310 exercises a version-specific (below-abi3-floor)
-        # wheel and cp312 the abi3 wheel that also serves 3.13/3.14, so cp311 and
-        # cp313 add no distinct build coverage on PRs. The free-threaded cp314t
+        # cut CI jobs. cp311 exercises a version-specific (below-abi3-floor)
+        # wheel and cp312 the abi3 wheel that also serves 3.13/3.14, so cp313
+        # adds no distinct build coverage on PRs. The free-threaded cp314t
         # job (via include below) still runs on every event.
-        py_ver: ${{ github.event_name == 'pull_request' && fromJSON('["cp310", "cp312"]') || fromJSON('["cp310", "cp311", "cp312", "cp313"]') }}
+        py_ver: ${{ github.event_name == 'pull_request' && fromJSON('["cp311", "cp312"]') || fromJSON('["cp311", "cp312", "cp313"]') }}
         include:
           - os: ubuntu-24.04
             py_ver: cp314t
             # test_ext allocates a ~2 GiB fp16 tensor and OOM-kills the
             # free-threaded runner (SIGKILL / exit 137), just as it does on the
             # Windows runner (see test_wheels_windows_cross). Skip it here; the
-            # same test still runs on the cp310-cp313 jobs (cp310/cp312 on PRs).
+            # same test still runs on the cp311-cp313 jobs (cp311/cp312 on PRs).
             pytest_args: '-k "not test_ext"'
+        # macOS runners are the slowest/most contended in this matrix; a pull
+        # request only needs one macOS build to confirm the platform still
+        # works, so drop it down to the oldest supported version there. push
+        # and release still need full coverage, so this only fires for the
+        # 'pull_request' trigger.
+        exclude: ${{ github.event_name == 'pull_request' && fromJSON('[{"os":"macos-15","py_ver":"cp312"}]') || fromJSON('[]') }}
     steps:
     - uses: actions/checkout@v7
       with:
@@ -77,7 +121,7 @@ jobs:
       if: startsWith(github.ref, 'refs/tags/v')
       run: echo "ONNXSIM_RELEASE=${{ github.ref_name }}" >> ${GITHUB_ENV}
     - name: Build onnxsim wheels
-      uses: pypa/cibuildwheel@v4.2.0
+      uses: pypa/cibuildwheel@v4.2.1
       env:
         CIBW_BUILD: "${{ matrix.py_ver }}-*"
     - name: Check ABI3
@@ -91,12 +135,134 @@ jobs:
         path: ./wheelhouse/*.whl
       if: ${{ !contains(fromJSON('["cp313"]'), matrix.py_ver) }}
 
+  # Runs onnxsim's Z3-based translation-validation proof suite
+  # (tests/test_formal_verify_*.py, plus test_fusion_patterns.py and
+  # test_ort_matmul_nbits_workaround.py) exactly ONCE -- these tests are
+  # otherwise skipped (via tests/_formal_verify_common.py's own
+  # `pytest.importorskip("z3")`) on every build_wheels/test_wheels_windows_cross
+  # leg, since the Z3 queries and differential logic they exercise have no
+  # OS/arch/interpreter dependence: running the same ~10-minute suite
+  # identically on every wheel platform would just multiply CI cost with no
+  # additional coverage.
+  #
+  # Deliberately does NOT `needs: build_wheels` / download one of its
+  # artifacts: a `needs` on a matrixed job waits for every leg of that matrix
+  # (including the slowest -- macOS), which put this suite on the release
+  # critical path behind wheel platforms it has no dependence on at all. It
+  # builds its own onnxsim extension instead, the same way build_sdist does
+  # (native `pip install .`, which setup.py already configures with
+  # -DONNXSIM_BUILTIN_ORT=OFF -- identical to what the wheel build ships), so
+  # it runs fully in parallel with build_wheels rather than serialized after
+  # it.
+  test_formal_verification:
+    name: Formal verification (Z3 translation-validation proofs)
+    runs-on: ubuntu-24.04
+    env:
+      CMAKE_GENERATOR: Ninja
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      CMAKE_LINKER_TYPE: LLD
+      SCCACHE_GHA_ENABLED: on
+      ACTIONS_CACHE_SERVICE_V2: on
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install formal-verification test deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ninja sccache pytest onnxruntime ml_dtypes z3-solver
+      - name: Build and install onnxsim
+        run: python -m pip install -v .
+      # Run from a neutral directory (matching test_wheels_windows_cross's own
+      # established fix for the identical problem): the repo root's own
+      # ./onnxsim/ source package (a plain Python package directory, no
+      # compiled extension) would otherwise shadow the installed wheel on
+      # sys.path, since Python prepends the current directory -- pytest still
+      # finds pyproject.toml's [tool.pytest.ini_options] and tests/'s own
+      # sibling-module imports (e.g. _formal_verify_common) by walking up from
+      # the absolute test paths given below, so nothing else needs to change.
+      - name: Verify onnxsim under test is the freshly built extension
+        working-directory: ${{ runner.temp }}
+        run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print('onnxsim', onnxsim.__version__); print(m.__file__)"
+      - name: Run Z3 formal-verification proof suite
+        working-directory: ${{ runner.temp }}
+        run: |
+          pytest -v "${GITHUB_WORKSPACE}"/tests/test_formal_verify_*.py "${GITHUB_WORKSPACE}/tests/test_fusion_patterns.py" "${GITHUB_WORKSPACE}/tests/test_ort_matmul_nbits_workaround.py"
+
+  # Runs onnxsim's Axera/Axelera/Pulsar2 NPU-backend suite plus the
+  # quantization- and pruning-algorithm suites (tests/test_axera_*.py,
+  # tests/test_axelera_*.py, tests/test_pulsar2_*.py,
+  # tests/test_voyager_sdk_patterns.py, and every test file whose name
+  # contains "quant"/"gguf"/"prun" -- see tests/conftest.py's
+  # pytest_collection_modifyitems for how the axera/quantization/pruning
+  # markers below get applied) exactly ONCE -- these tests exercise
+  # onnxsim's own algorithm/format logic against onnx's reference evaluator
+  # (or, for the Axera mcode suites, a committed fixture), not anything
+  # OS/arch/interpreter-dependent, so running hundreds of them identically
+  # on every build_wheels/test_wheels_windows_cross leg (2 OSes x up to 4
+  # Python versions) would just multiply CI cost with no additional
+  # coverage. They run exactly once here instead; every other leg
+  # deselects all three markers with
+  # `-m "not axera and not quantization and not pruning"`.
+  #
+  # Deliberately does NOT `needs: build_wheels`, for the same reason
+  # test_formal_verification (right above) doesn't: it builds its own
+  # onnxsim extension (native `pip install .`, matching what the wheel
+  # build ships) so it runs fully in parallel with build_wheels rather than
+  # serialized behind its slowest (macOS) leg.
+  test_axera_quantization_pruning:
+    name: Axera/quantization/pruning suites
+    runs-on: ubuntu-24.04
+    env:
+      CMAKE_GENERATOR: Ninja
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      CMAKE_LINKER_TYPE: LLD
+      SCCACHE_GHA_ENABLED: on
+      ACTIONS_CACHE_SERVICE_V2: on
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      # pytest -m (below) still has to IMPORT every file under tests/ to
+      # collect it before the marker filter can deselect it -- so this needs
+      # every dependency any test file anywhere in the suite imports at
+      # module level, not just what the axera/quantization/pruning suites
+      # themselves use. Matches build_wheels' CIBW_TEST_REQUIRES +
+      # CIBW_BEFORE_TEST exactly, for that reason.
+      - name: Install test deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ninja sccache pytest onnxruntime onnxscript==0.6.2 timm==1.0.26 sympy onnx-shape-inference onnxslim onnx_safetensors ml_dtypes
+          python -m pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
+      - name: Build and install onnxsim
+        run: python -m pip install -v .
+      # Run from a neutral directory, same reason as test_formal_verification
+      # above: the repo root's ./onnxsim source package would otherwise
+      # shadow the installed wheel on sys.path.
+      - name: Verify onnxsim under test is the freshly built extension
+        working-directory: ${{ runner.temp }}
+        run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print('onnxsim', onnxsim.__version__); print(m.__file__)"
+      - name: Run Axera/quantization/pruning suites
+        working-directory: ${{ runner.temp }}
+        run: |
+          pytest -v -m "axera or quantization or pruning" "${GITHUB_WORKSPACE}/tests"
+
   # Windows wheels are cross-compiled on a cheap Ubuntu runner with llvm-mingw
   # (clang + lld + a self-contained UCRT sysroot) instead of built natively on a
   # Windows runner. 3.12 and 3.13 share a single cp312-abi3 wheel (nanobind
   # limited-API module + the stable-ABI python3.lib from the CPython NuGet
-  # package); 3.10 and 3.11 are below the abi3 floor and get version-specific
-  # wheels. See scripts/cross/README.md.
+  # package); 3.11 is below the abi3 floor and gets a version-specific
+  # wheel. See scripts/cross/README.md.
   build_wheels_windows_cross:
     name: Cross-build Windows wheel on Ubuntu (${{ matrix.artifact }}, llvm-mingw)
     env:
@@ -109,7 +275,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { py_ver: '3.10', abi3: '0', artifact: cp310 }   # version-specific (below abi3 floor)
           - { py_ver: '3.11', abi3: '0', artifact: cp311 }   # version-specific (below abi3 floor)
           - { py_ver: '3.12', abi3: '1', artifact: abi3 }    # abi3: also serves 3.13+
     steps:
@@ -156,10 +321,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The 3.13 job re-tests the exact cp312-abi3 wheel the 3.12 job already
-        # covers, so drop it on pull_request to cut a CI job; push/release still
-        # test both.
-        include: ${{ github.event_name == 'pull_request' && fromJSON('[{"py_ver":"3.10","artifact":"cp310"},{"py_ver":"3.11","artifact":"cp311"},{"py_ver":"3.12","artifact":"abi3"}]') || fromJSON('[{"py_ver":"3.10","artifact":"cp310"},{"py_ver":"3.11","artifact":"cp311"},{"py_ver":"3.12","artifact":"abi3"},{"py_ver":"3.13","artifact":"abi3"}]') }}
+        # A pull request only needs a smoke test that the cross-built wheels
+        # still install and run, so it's cut down to just the oldest (cp311)
+        # artifact there; push/release still test all three (the 3.13 entry
+        # re-tests the exact cp312-abi3 wheel the 3.12 job already covers, but
+        # that's fine outside PRs where CI job count matters less).
+        include: ${{ github.event_name == 'pull_request' && fromJSON('[{"py_ver":"3.11","artifact":"cp311"}]') || fromJSON('[{"py_ver":"3.11","artifact":"cp311"},{"py_ver":"3.12","artifact":"abi3"},{"py_ver":"3.13","artifact":"abi3"}]') }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -169,7 +336,7 @@ jobs:
           python-version: ${{ matrix.py_ver }}
       # uv installs (and links) much faster than pip; its global cache (keyed on
       # the requirements + this workflow) caches the packages, torch included.
-      - uses: astral-sh/setup-uv@v10.0.1
+      - uses: astral-sh/setup-uv@v10.1.0
         with:
           enable-cache: true
           # Per-Python cache: setup-uv's key omits the interpreter version, so
@@ -203,7 +370,12 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           # test_ext allocates a ~2 GiB fp16 tensor; skip it on the Windows runner.
-          pytest -v -k "not test_ext" "${GITHUB_WORKSPACE}/tests"
+          # The axera/quantization/pruning suites are also skipped here, same
+          # as every build_wheels leg (see that job's CIBW_TEST_COMMAND and
+          # tests/conftest.py's pytest_collection_modifyitems): they run
+          # exactly once, in the dedicated test_axera_quantization_pruning
+          # job, since they have no OS/arch/interpreter-dependent behavior.
+          pytest -v -k "not test_ext" -m "not axera and not quantization and not pruning" "${GITHUB_WORKSPACE}/tests"
           onnxsim -h
           onnxsim --list-default-optimizers
 
@@ -261,7 +433,7 @@ jobs:
   # wheel. See docs/wasm_pyodide.md's "Distributable wheel" section for the
   # full story and what's still new/first-time-in-CI about this.
   #
-  # Release-flow-only (push/release/workflow_dispatch), not a plain
+  # Release-flow-only (push/release/schedule/workflow_dispatch), not a plain
   # pull_request: the underlying wasm32 build is already functionally
   # validated per-PR by the separate, path-filtered pyodide-wasm.yml (build +
   # real Pyodide/Node import test). This job's only real job is producing the
@@ -269,10 +441,10 @@ jobs:
   # ~10min wasm cross-compile on every one of this repo's PRs (unlike
   # pyodide-wasm.yml, THIS workflow's own pull_request trigger has no path
   # filter at all) isn't worth paying for something with no release
-  # consequence until a tag exists. A push to master already exercises this
-  # for real, safely: upload_pypi below publishes push builds to Test PyPI,
-  # not the real index, so this gets a genuine dry run on every master push
-  # before it can ever gate an actual release.
+  # consequence until a tag exists. The daily schedule already exercises this
+  # for real, safely: upload_pypi below publishes scheduled (and manually
+  # dispatched) builds to Test PyPI, not the real index, so this gets a
+  # genuine dry run once a day before it can ever gate an actual release.
   #
   # continue-on-error: true -- this is new, first-time-in-CI automation (the
   # only prior validation was one hand-assembled wheel, at a now-outdated ABI
@@ -415,9 +587,9 @@ jobs:
           path: wheelhouse/onnxsim-*.whl
 
   upload_pypi:
-    if: (github.repository == 'onnxsim/onnxsim') && (github.event_name == 'push' || github.event_name == 'release')
+    if: (github.repository == 'onnxsim/onnxsim') && (github.event_name == 'release' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     name: Upload to PyPI
-    needs: [build_wheels, build_wheels_windows_cross, test_wheels_windows_cross, build_sdist, build_wheel_pyodide]
+    needs: [build_wheels, test_formal_verification, test_axera_quantization_pruning, build_wheels_windows_cross, test_wheels_windows_cross, build_sdist, build_wheel_pyodide]
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -425,6 +597,29 @@ jobs:
     permissions:
       id-token: write
     steps:
+    # Test PyPI is no longer published on every master push -- only the daily
+    # `schedule` trigger (and an on-demand workflow_dispatch with
+    # publish_test_pypi=true, see the `on:` block) reach that step below. On
+    # a scheduled run, skip the actual upload entirely if master hasn't
+    # picked up any new commits since the last day (pypa/gh-action-pypi-publish
+    # would otherwise just fail re-uploading an unchanged .devN version).
+    # This checkout runs (and must run) before download-artifact below:
+    # actions/checkout cleans the workspace (git clean -ffdx) by default,
+    # which would otherwise delete the just-downloaded dist/ artifacts.
+    - name: Check out repository (commit-recency check for scheduled runs)
+      if: ${{ github.event_name == 'schedule' }}
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+    - name: Check for new commits on master in the last day
+      id: commit_check
+      if: ${{ github.event_name == 'schedule' }}
+      run: |
+        if [ -n "$(git log -1 --since='24 hours ago' --format=%H)" ]; then
+          echo "has_new_commits=true" >> "${GITHUB_OUTPUT}"
+        else
+          echo "has_new_commits=false" >> "${GITHUB_OUTPUT}"
+        fi
     - uses: actions/download-artifact@v8
       with:
         # unpacks python-dist artifact into dist/
@@ -433,7 +628,12 @@ jobs:
         path: dist
         merge-multiple: true
     - name: Publish distribution 📦 to Test PyPI
-      if: ${{ github.ref == 'refs/heads/master' }}
+      if: >-
+        github.ref == 'refs/heads/master' &&
+        (
+          (github.event_name == 'schedule' && steps.commit_check.outputs.has_new_commits == 'true') ||
+          (github.event_name == 'workflow_dispatch' && inputs.publish_test_pypi)
+        )
       uses: pypa/gh-action-pypi-publish@release/v1
       with:
         repository_url: https://test.pypi.org/legacy/

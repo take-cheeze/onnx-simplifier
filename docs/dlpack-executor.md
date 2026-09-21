@@ -109,6 +109,78 @@ One boundary, several adapters (`dlpack_bridge.h` holds the conversions):
 | `CppModelExecutor` | onnxsim.cpp (built-in ORT) | `BorrowAsOrtValue` wraps the feed buffer via ORT's borrowing `CreateTensor` — **zero copy** | `FromOrtValue` moves ORT's own output buffer into the managed tensor — **zero copy** | none at the boundary |
 | `CApiModelExecutor` | capi/onnxsim_c_api.cpp | host receives borrowed `DLManagedTensor*` | host returns owned `DLManagedTensor*`, released via their deleters | host's choice |
 | `PyModelExecutor` | cpp2py_export.cc | `ToTensorProto` → bytes | bytes → `FromTensorProtoOwning` | protobuf round trip (see below) |
+| `XnnpackModelExecutor` | xnnpack_executor.cpp (`ONNXSIM_BUILTIN_XNNPACK`) | feed pointers passed straight to `xnn_setup_runtime_v2` as `xnn_external_value`s — **zero copy** | XNNPACK writes into an executor-allocated `std::vector<float>` (it has no ORT-style "hand back the session's buffer" mode) — **one copy at the boundary** (allocation, not a memcpy) | one allocation per output |
+
+### XNNPACK: an explicitly-partial backend, not a drop-in ORT replacement
+
+`GetXnnpackModelExecutor()` (`onnxsim/xnnpack_executor.h` declares it, guarded
+by `ONNXSIM_HAS_XNNPACK`) runs fold groups through Google's
+[XNNPACK](https://github.com/google/XNNPACK) instead of ONNX Runtime, going
+through XNNPACK's own graph-level **Subgraph API**
+(`xnn_create_subgraph`/`xnn_define_*`/`xnn_create_runtime_v4`) rather than its
+per-operator kernel API. `onnxsim/onnx_to_xnnpack_subgraph.{h,cpp}` is the
+ONNX-ModelProto-to-`xnn_subgraph_t` lowering; `onnxsim/xnnpack_executor.cpp`
+is the `ModelExecutor` adapter that creates a runtime from the result, feeds
+it the call's `inputs`, invokes it, and wraps the outputs as
+`DLManagedTensor`s.
+
+Unlike `CppModelExecutor`, which delegates to ORT and so handles essentially
+any ONNX op, this lowering supports only a small, explicit op set — see
+`onnx_to_xnnpack_subgraph.h`'s `kSupportedOps`. `Lower()` throws
+`std::runtime_error` naming the reason for anything outside that: an
+unsupported op, an unsupported tensor dtype, `Gemm` with `alpha != 1` or
+`transA != 0`, a `Reshape` target shape that is itself produced by another
+node in the fold group rather than being a constant or a feed, and so on.
+Notably absent is `Conv`: XNNPACK's convolution Node is NHWC-native while
+ONNX's is NCHW, and getting that layout conversion (activations *and* the
+OIHW→OHWI weight transpose) right needs more verification than this first
+cut has had — left as follow-up work rather than shipped un-verified.
+
+Most of the op set is fp32 only: `Add`/`Sub`/`Mul`/`Div`, `Relu`, `Sigmoid`,
+`Gemm`/`MatMul` (2D operands only), `Reshape` (static target shape only).
+`QuantizeLinear`, `DequantizeLinear`, and `QLinearMatMul` additionally
+support standard ONNX int8/uint8 quantization, mapped onto XNNPACK's own
+quantized datatypes (`qint8`/`quint8`/`qcint8`) — `QuantizeLinear`/
+`DequantizeLinear` lower to an `xnn_unary_convert` Node bridging an fp32
+Value and a quantized one; `QLinearMatMul` (no float in between; a's/b's/
+y's own quantized Values feed `xnn_define_fully_connected` directly, the
+same Node Gemm/MatMul use) supports `b` quantized per-tensor or per-column.
+Scope is deliberately narrower here too: per-tensor only for
+`QuantizeLinear`/`DequantizeLinear` and `QLinearMatMul`'s output, symmetric
+(`zero_point == 0`) only for per-channel quantization (XNNPACK's per-channel
+datatypes don't have a per-channel zero-point parameter at the API surface
+this lowering uses), and no `com.microsoft` contrib ops (`QGemm`,
+`QLinearConv`, `QLinearAdd`, ...) — only standard ONNX.
+
+One correctness trap worth flagging for anyone extending this further:
+`xnn_define_channelwise_quantized_tensor_value` stores its `scale` array as
+a bare pointer (read again whenever a runtime is created from the
+subgraph), not a copy — unlike `dims`, which it does copy. A per-channel
+scale array therefore needs the same "outlive the subgraph and any runtime
+built from it" lifetime as tensor data does (see
+`LoweredSubgraph::owned_scale_arrays`, parallel to `owned_tensors`); get
+this wrong and the failure mode is not a crash, it's silent all-zero
+output, caught only by an actual numeric test
+(`xnnpack_executor_test.cpp`'s per-channel `QLinearMatMul` case), not a
+build or a null-pointer check.
+
+This makes `GetXnnpackModelExecutor()` an explicitly opt-in *alternative*
+executor (pass it to `Simplify` instead of `GetBuiltinModelExecutor()` when
+you specifically want XNNPACK — e.g. to test XNNPACK embeddability the same
+way `tests/test_tinygrad_integration.py` tests that backend), not a general-purpose replacement: swapping it in for a
+model using an unsupported op fails constant folding outright rather than
+falling back. `onnxsim/xnnpack_executor_test.cpp` exercises it end to end
+(each supported op, a two-node chain, quantize/dequantize round trips,
+per-tensor and per-channel `QLinearMatMul`, and the unsupported-op error
+path) against independently-computed expected values.
+
+Build it with `-DONNXSIM_BUILTIN_XNNPACK=ON` (see `cmake/build_xnnpack.cmake`,
+which `FetchContent`s XNNPACK — pinned by commit, since XNNPACK has no tagged
+releases — the same way ORT's from-source build fetches its own `cpuinfo` and
+`pthreadpool` dependencies). It composes with `ONNXSIM_BUILTIN_ORT`
+independently: a build can have either, both, or neither, and the caller
+picks which `GetXxxModelExecutor()` to hand `Simplify`. Not supported for the
+Emscripten/WebAssembly build.
 
 The Python adapter still pays a `TensorProto` round trip because the Python side
 (onnxruntime's Python API, onnx's reference evaluator) speaks `TensorProto`, not
@@ -200,15 +272,15 @@ Consequences for the design:
   so the test ships a small ONNX-subset-to-Halide lowering and checks that
   onnxsim's simplified output still lowers, compiles, and computes the same
   result as onnx's reference evaluator.
-- `tests/test_nncase_integration.py` (+ `.github/workflows/backend-integration.yml`) —
+- `tests/test_tinygrad_integration.py` (+ `.github/workflows/backend-integration.yml`) —
   the same embeddability claim exercised against
-  [nncase](https://github.com/kendryte/nncase), the model compiler for the
-  Kendryte K230 / K510 processors (and a generic `cpu` target). nncase imports
-  an ONNX `ModelProto` directly, compiles it, and can evaluate the compiled
-  module, so the test feeds onnxsim's simplified output into nncase and checks
-  it still imports, compiles, and computes the same result. Every op the test
-  models use is drawn from nncase's supported-ops list
-  (<https://github.com/kendryte/nncase/blob/master/docs/onnx_ops.md>).
+  [tinygrad](https://github.com/tinygrad/tinygrad)'s own `OnnxRunner`
+  (`tinygrad.nn.onnx.OnnxRunner`), which imports and eagerly executes an ONNX
+  `ModelProto` directly -- no separate compile step, and no vendor hardware
+  needed (it runs on tinygrad's own default backend, typically CPU/CLANG on an
+  ordinary CI runner). This feeds onnxsim's simplified
+  output straight into the target's native ONNX frontend and checks it still
+  runs and computes the same result.
 
 ## Rust binding
 

@@ -1,0 +1,479 @@
+"""Tests for ``onnxsim.apply_mixed_precision_quantization`` -- see
+``onnxsim/mixed_precision.py`` for the technique (calibration-driven
+per-layer choice between block-wise INT8 and block-wise INT4) -- and for
+``onnxsim.search_mixed_precision_for_budget``, the accuracy-aware search
+over that dispatcher's own ``high_bits_fraction`` (see that function's
+docstring in ``onnxsim/mixed_precision.py``).
+"""
+
+import numpy as np
+import onnx
+import onnx.helper
+import onnx.numpy_helper
+import pytest
+from onnx import parser
+
+import onnxsim
+
+ort = pytest.importorskip("onnxruntime")
+
+
+def _vi(name, shape):
+    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+
+
+def _f32(array, name):
+    return onnx.numpy_helper.from_array(array.astype(np.float32), name)
+
+
+def _model(nodes, inputs, outputs, initializer, opset=21):
+    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
+    return onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+    )
+
+
+def _run(model, feeds):
+    sess = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    return sess.run(None, feeds)
+
+
+def _rel_l2(a, b):
+    a = np.asarray(a, dtype=np.float64).ravel()
+    b = np.asarray(b, dtype=np.float64).ravel()
+    return np.linalg.norm(a - b) / max(np.linalg.norm(a), 1e-6)
+
+
+def _two_layer_model(K=32, H=16, N=8, seed=0, opset=21):
+    rng = np.random.default_rng(seed)
+    w1 = rng.standard_normal((K, H)).astype(np.float32) * 0.5
+    # w2's rows get planted, large-magnitude outliers, making it far more
+    # sensitive to INT4 quantization than w1 -- so a good sensitivity
+    # ranking should pick THIS layer for the INT8 tier.
+    w2 = rng.standard_normal((H, N)).astype(np.float32) * 0.05
+    w2[0, :] = 20.0
+    nodes = [
+        onnx.helper.make_node("MatMul", ["X", "W1"], ["H1"]),
+        onnx.helper.make_node("MatMul", ["H1", "W2"], ["Y"]),
+    ]
+    return _model(
+        nodes,
+        [_vi("X", ["batch", K])],
+        [_vi("Y", ["batch", N])],
+        [_f32(w1, "W1"), _f32(w2, "W2")],
+        opset=opset,
+    )
+
+
+def test_mixed_precision_output_stays_close_to_float_via_onnxruntime():
+    model = _two_layer_model(K=32, H=16, N=8, seed=0)
+    q = onnxsim.apply_mixed_precision_quantization(
+        model, block_size=8, high_bits_fraction=0.5, num_samples=16, seed=1
+    )
+    onnx.checker.check_model(q)
+
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((8, 32)).astype(np.float32)
+    (float_y,) = _run(model, {"X": x})
+    (q_y,) = _run(q, {"X": x})
+    assert np.all(np.isfinite(q_y))
+    assert _rel_l2(float_y, q_y) < 0.3
+
+
+def test_mixed_precision_picks_the_more_sensitive_layer_for_int8():
+    model = _two_layer_model(K=32, H=16, N=8, seed=3)
+    q = onnxsim.apply_mixed_precision_quantization(
+        model, block_size=8, high_bits_fraction=0.5, num_samples=32, seed=4
+    )
+    codes_by_prefix = {
+        t.name: t for t in q.graph.initializer if t.name.endswith("_codes")
+    }
+    w2_codes = next(t for name, t in codes_by_prefix.items() if name.startswith("W2_"))
+    w1_codes = next(t for name, t in codes_by_prefix.items() if name.startswith("W1_"))
+    # W2 has the planted outlier row -- it must be the INT8 (more precise)
+    # tier, while the ordinary W1 stays at INT4.
+    assert w2_codes.data_type == onnx.TensorProto.INT8
+    assert w1_codes.data_type == onnx.TensorProto.INT4
+
+
+def test_mixed_precision_zero_fraction_matches_all_int4():
+    model = _two_layer_model(K=32, H=16, N=8, seed=5)
+    q = onnxsim.apply_mixed_precision_quantization(
+        model, block_size=8, high_bits_fraction=0.0, num_samples=16, seed=6
+    )
+    codes = [t for t in q.graph.initializer if t.name.endswith("_codes")]
+    assert len(codes) == 2
+    assert all(t.data_type == onnx.TensorProto.INT4 for t in codes)
+
+
+def test_mixed_precision_one_fraction_matches_all_int8():
+    model = _two_layer_model(K=32, H=16, N=8, seed=7)
+    q = onnxsim.apply_mixed_precision_quantization(
+        model, block_size=8, high_bits_fraction=1.0, num_samples=16, seed=8
+    )
+    codes = [t for t in q.graph.initializer if t.name.endswith("_codes")]
+    assert len(codes) == 2
+    assert all(t.data_type == onnx.TensorProto.INT8 for t in codes)
+
+
+def test_mixed_precision_declines_when_k_not_divisible_by_block_size():
+    rng = np.random.default_rng(9)
+    weight = rng.standard_normal((20, 4)).astype(np.float32)  # 20 not a multiple of 8
+    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
+    model = _model(
+        nodes, [_vi("X", ["batch", 20])], [_vi("Y", ["batch", 4])], [_f32(weight, "W")]
+    )
+    q = onnxsim.apply_mixed_precision_quantization(model, block_size=8)
+    assert q.SerializeToString() == model.SerializeToString()
+
+
+def test_mixed_precision_declines_non_constant_weight():
+    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
+    model = _model(
+        nodes, [_vi("X", [4, 32]), _vi("W", [32, 4])], [_vi("Y", [4, 4])], []
+    )
+    q = onnxsim.apply_mixed_precision_quantization(model)
+    assert q.SerializeToString() == model.SerializeToString()
+
+
+def test_mixed_precision_noop_when_no_matmul_present():
+    nodes = [onnx.helper.make_node("Relu", ["X"], ["Y"])]
+    model = _model(nodes, [_vi("X", [4, 4])], [_vi("Y", [4, 4])], [])
+    result = onnxsim.apply_mixed_precision_quantization(model)
+    assert result.SerializeToString() == model.SerializeToString()
+
+
+def test_mixed_precision_declines_below_opset21():
+    model = _two_layer_model(K=32, H=16, N=8, opset=13)
+    result = onnxsim.apply_mixed_precision_quantization(model)
+    assert result.SerializeToString() == model.SerializeToString()
+
+
+def _two_independent_layer_model(K=8, N=4, block_size=4, seed=0):
+    # Two UNCHAINED MatMuls sharing the exact same weight values (so their
+    # raw INT4 quantization MSE is identical), each block_size-wide K split
+    # into a "noisy" block (large-magnitude weights -> large absolute
+    # per-block quantization error) and a "quiet" block (tiny weights ->
+    # tiny error). This isolates a case a single-scalar
+    # `mse * mean(activation^2)` sensitivity score (this module's original
+    # heuristic) cannot distinguish -- both layers have the same overall MSE
+    # -- from the per-input-channel Hessian-diagonal score, which can: see
+    # test_mixed_precision_prefers_layer_whose_error_and_activation_energy_coincide.
+    rng = np.random.default_rng(seed)
+    assert (
+        K % block_size == 0 and K // block_size == 2
+    )  # exactly one noisy, one quiet block
+    w = np.concatenate(
+        [
+            rng.standard_normal((N, block_size))
+            * 1.0,  # noisy block (cols 0:block_size)
+            rng.standard_normal((N, block_size)) * 0.02,  # quiet block
+        ],
+        axis=1,
+    ).T.astype(np.float32)  # [K, N], transB=0 layout
+    nodes = [
+        onnx.helper.make_node("MatMul", ["Xp", "W"], ["Yp"]),
+        onnx.helper.make_node("MatMul", ["Xq", "W"], ["Yq"]),
+    ]
+    return _model(
+        nodes,
+        [_vi("Xp", ["batch", K]), _vi("Xq", ["batch", K])],
+        [_vi("Yp", ["batch", N]), _vi("Yq", ["batch", N])],
+        [_f32(w, "W")],
+    )
+
+
+def test_mixed_precision_prefers_layer_whose_error_and_activation_energy_coincide():
+    # Both MatMuls use the identical weight `W` above (identical MSE either
+    # way), so a sensitivity score built from one scalar mean(activation^2)
+    # per layer cannot tell them apart *if* their overall activation energy
+    # also happens to match -- exactly arranged here (`xp`/`xq` are the same
+    # values with their two blocks swapped, so both layers see the same
+    # total sum(activation^2)). The per-input-channel Hessian-diagonal score
+    # (this module's current scheme) can still tell them apart: "p"'s large
+    # activations land on the noisy (high quantization error) block, "q"'s
+    # land on the quiet block, so "p" is the genuinely more sensitive layer
+    # and must be the one promoted to INT8.
+    K, N, block_size = 8, 4, 4
+    model = _two_independent_layer_model(K=K, N=N, block_size=block_size, seed=11)
+
+    rng = np.random.default_rng(12)
+    noisy_block = rng.standard_normal((6, block_size)) * 5.0
+    quiet_block = rng.standard_normal((6, block_size)) * 0.02
+    xp = np.concatenate([noisy_block, quiet_block], axis=1).astype(np.float32)
+    xq = np.concatenate([quiet_block, noisy_block], axis=1).astype(np.float32)
+    # The two layers' overall activation energy is identical by construction
+    # (same blocks, swapped) -- the old single-scalar heuristic would have
+    # tied them.
+    assert np.isclose(np.sum(xp**2), np.sum(xq**2))
+
+    q = onnxsim.apply_mixed_precision_quantization(
+        model,
+        calibration_data=[{"Xp": xp, "Xq": xq}],
+        high_bits_fraction=0.5,  # exactly one of the two layers gets INT8
+        block_size=block_size,
+    )
+    # Both candidates quantize the same initializer name ("W"), so identify
+    # each new MatMul's own codes by tracing its input back to Xp/Xq instead
+    # of by initializer name.
+    matmuls = [n for n in q.graph.node if n.op_type == "MatMul"]
+    dequant_of = {
+        n.output[0]: n for n in q.graph.node if n.op_type == "DequantizeLinear"
+    }
+    codes_dtype_by_input = {}
+    for mm in matmuls:
+        x_name, w_dequant_name = mm.input
+        dq = dequant_of[w_dequant_name]
+        codes_init = next(t for t in q.graph.initializer if t.name == dq.input[0])
+        codes_dtype_by_input[x_name] = codes_init.data_type
+
+    assert codes_dtype_by_input["Xp"] == onnx.TensorProto.INT8
+    assert codes_dtype_by_input["Xq"] == onnx.TensorProto.INT4
+
+
+# --------------------------------------------------------------------------- #
+# sensitivity_metric="full_hessian" -- see onnxsim/mixed_precision.py's own
+# docstring for the formula. These first three test the pure math directly
+# (no ONNX graph or calibration data involved) since hand-picked small
+# matrices make the expected cross-channel-correlation effect exact and
+# easy to verify by hand, unlike a real quantized layer's rounding error.
+# --------------------------------------------------------------------------- #
+def test_full_hessian_sensitivity_matches_diagonal_when_h_is_diagonal():
+    # With no off-diagonal terms, the exact quadratic form must equal its
+    # own diagonal approximation exactly.
+    rng = np.random.default_rng(30)
+    err_nk = rng.standard_normal((5, 4))
+    diag_vals = np.array([0.5, 1.0, 2.0, 3.0])
+    h = np.diag(diag_vals)
+    assert onnxsim.mixed_precision._full_hessian_sensitivity(
+        err_nk, h
+    ) == pytest.approx(
+        onnxsim.mixed_precision._hessian_diag_sensitivity(err_nk, diag_vals)
+    )
+
+
+def test_full_hessian_sensitivity_captures_positive_cross_channel_correlation():
+    # e = [1, 1]; H = [[1, 0.5], [0.5, 1]]. Quadratic form by hand:
+    # H_00*e0^2 + H_11*e1^2 + 2*H_01*e0*e1 = 1 + 1 + 2*0.5*1*1 = 3.0, vs.
+    # the diagonal-only approximation's 1 + 1 = 2.0 -- the positive
+    # off-diagonal term (positively correlated input channels) raises the
+    # exact score above the diagonal one.
+    err_nk = np.array([[1.0, 1.0]])
+    diag_h = np.array([1.0, 1.0])
+    h = np.array([[1.0, 0.5], [0.5, 1.0]])
+    assert onnxsim.mixed_precision._hessian_diag_sensitivity(
+        err_nk, diag_h
+    ) == pytest.approx(2.0)
+    assert onnxsim.mixed_precision._full_hessian_sensitivity(
+        err_nk, h
+    ) == pytest.approx(3.0)
+
+
+def test_full_hessian_sensitivity_negative_correlation_lowers_the_score():
+    # Same error and diagonal as above, but negatively correlated channels
+    # (H_01 = -0.5 instead of +0.5) must lower the exact score below the
+    # diagonal-only baseline instead of raising it.
+    err_nk = np.array([[1.0, 1.0]])
+    h_pos = np.array([[1.0, 0.5], [0.5, 1.0]])
+    h_neg = np.array([[1.0, -0.5], [-0.5, 1.0]])
+    assert onnxsim.mixed_precision._full_hessian_sensitivity(
+        err_nk, h_neg
+    ) < onnxsim.mixed_precision._full_hessian_sensitivity(err_nk, h_pos)
+
+
+def test_mixed_precision_rejects_unknown_sensitivity_metric():
+    model = _two_layer_model(K=32, H=16, N=8, seed=0)
+    with pytest.raises(ValueError, match="sensitivity_metric"):
+        onnxsim.apply_mixed_precision_quantization(
+            model, sensitivity_metric="not-a-real-metric"
+        )
+
+
+def test_mixed_precision_full_hessian_still_picks_the_obvious_outlier_layer():
+    # A sanity/wiring check on the clear-cut case both metrics should agree
+    # on (same model and assertion as
+    # test_mixed_precision_picks_the_more_sensitive_layer_for_int8, just
+    # with sensitivity_metric="full_hessian") -- the interesting case where
+    # the two metrics actually *disagree* is exercised at the pure-math
+    # level above, where hand-picked matrices make the expected direction
+    # unambiguous.
+    model = _two_layer_model(K=32, H=16, N=8, seed=3)
+    q = onnxsim.apply_mixed_precision_quantization(
+        model,
+        block_size=8,
+        high_bits_fraction=0.5,
+        num_samples=32,
+        seed=4,
+        sensitivity_metric="full_hessian",
+    )
+    codes_by_prefix = {
+        t.name: t for t in q.graph.initializer if t.name.endswith("_codes")
+    }
+    w2_codes = next(t for name, t in codes_by_prefix.items() if name.startswith("W2_"))
+    w1_codes = next(t for name, t in codes_by_prefix.items() if name.startswith("W1_"))
+    assert w2_codes.data_type == onnx.TensorProto.INT8
+    assert w1_codes.data_type == onnx.TensorProto.INT4
+
+
+def test_mixed_precision_full_hessian_output_stays_close_to_float():
+    model = _two_layer_model(K=32, H=16, N=8, seed=0)
+    q = onnxsim.apply_mixed_precision_quantization(
+        model,
+        block_size=8,
+        high_bits_fraction=0.5,
+        num_samples=16,
+        seed=1,
+        sensitivity_metric="full_hessian",
+    )
+    onnx.checker.check_model(q)
+
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((8, 32)).astype(np.float32)
+    (float_y,) = _run(model, {"X": x})
+    (q_y,) = _run(q, {"X": x})
+    assert np.all(np.isfinite(q_y))
+    assert _rel_l2(float_y, q_y) < 0.3
+
+
+# --------------------------------------------------------------------------- #
+# search_mixed_precision_for_budget
+# --------------------------------------------------------------------------- #
+# Named `_text_model` (rather than reusing `_model` above) since this repo's
+# CLAUDE.md asks new test model-building code to go through `onnx.parser`,
+# but `_model` above already names the onnx.helper-based builder the earlier
+# tests in this file use.
+def _text_model(body, initializer=(), opset=21, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
+
+
+def _search_test_model(seed=0, outlier=20.0):
+    # Two chained MatMuls, K=32/H=16/N=8 (block_size=8 divides both). W2's
+    # first row (every output channel's weight for hidden unit 0) is set to
+    # a large-but-not-extreme outlier: big enough (400x W2's other weights'
+    # scale) that the sensitivity ranking unambiguously ranks W2 above W1 on
+    # any platform (their MSE*activation-energy scores differ by ~5 orders
+    # of magnitude, nowhere near a rounding-boundary tie -- see this repo's
+    # own CLAUDE.md note on `tests/test_gptaq.py`'s prior single-seed
+    # flakiness for why that margin matters), while still leaving room for
+    # promoting more layers to INT8 to actually reduce the measured output
+    # error (an outlier so extreme it saturates the block scale would make
+    # INT4-vs-INT8 equally (in)accurate for that block, which would defeat
+    # the point of this test).
+    rng = np.random.default_rng(seed)
+    w1 = (rng.standard_normal((32, 16)) * 0.5).astype(np.float32)
+    w2 = (rng.standard_normal((16, 8)) * 0.05).astype(np.float32)
+    w2[0, :] = outlier
+    return _text_model(
+        """
+        agraph (float[batch, 32] X) => (float[batch, 8] Y)
+        {
+            H1 = MatMul(X, W1)
+            Y = MatMul(H1, W2)
+        }
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+
+
+def test_search_mixed_precision_promotes_a_layer_to_meet_a_tight_budget():
+    model = _search_test_model(seed=0, outlier=20.0)
+    result = onnxsim.search_mixed_precision_for_budget(
+        model, accuracy_budget=0.15, block_size=8, num_samples=16, seed=1
+    )
+    assert result.meets_budget
+    assert result.report.all_finite
+    assert result.report.worst_relative_l2 < 0.15
+    # Starts at the smallest fraction and has to promote at least one layer
+    # (in fact needs every eligible layer at INT8 here) before meeting a
+    # tight budget -- a single INT8 layer alone (fractions 0.3/0.5) still
+    # leaves worst_relative_l2 far above 0.15.
+    assert (
+        result.fractions_tried[0] == onnxsim.mixed_precision.DEFAULT_SEARCH_FRACTIONS[0]
+    )
+    assert len(result.fractions_tried) > 1
+    assert result.high_bits_fraction > 0.0
+
+
+def test_search_mixed_precision_stops_at_first_fraction_for_generous_budget():
+    model = _search_test_model(seed=0, outlier=20.0)
+    result = onnxsim.search_mixed_precision_for_budget(
+        model, accuracy_budget=1.0, block_size=8, num_samples=16, seed=1
+    )
+    assert result.meets_budget
+    default_fractions = onnxsim.mixed_precision.DEFAULT_SEARCH_FRACTIONS
+    assert result.fractions_tried == [default_fractions[0]]
+    assert result.high_bits_fraction == default_fractions[0]
+
+
+def test_search_mixed_precision_exhausts_fractions_for_impossible_budget():
+    model = _search_test_model(seed=0, outlier=20.0)
+    fractions = (0.0, 0.1, 0.4, 1.0)
+    result = onnxsim.search_mixed_precision_for_budget(
+        model,
+        accuracy_budget=1e-12,
+        fractions=fractions,
+        block_size=8,
+        num_samples=16,
+        seed=1,
+    )
+    assert not result.meets_budget
+    assert result.fractions_tried == list(fractions)
+    assert result.high_bits_fraction == fractions[-1]
+
+
+def test_search_mixed_precision_winner_matches_direct_call():
+    model = _search_test_model(seed=0, outlier=20.0)
+    calibration_data = onnxsim.generate_random_calibration_data(
+        model, num_samples=16, seed=1
+    )
+    result = onnxsim.search_mixed_precision_for_budget(
+        model,
+        accuracy_budget=0.15,
+        block_size=8,
+        calibration_data=calibration_data,
+    )
+    direct = onnxsim.apply_mixed_precision_quantization(
+        model,
+        calibration_data=calibration_data,
+        high_bits_fraction=result.high_bits_fraction,
+        block_size=8,
+    )
+    assert result.quantized_model.SerializeToString() == direct.SerializeToString()
+
+
+def test_search_mixed_precision_respects_custom_fractions():
+    model = _search_test_model(seed=0, outlier=20.0)
+    calibration_data = onnxsim.generate_random_calibration_data(
+        model, num_samples=16, seed=1
+    )
+    custom_fractions = (0.0, 1.0)
+    result = onnxsim.search_mixed_precision_for_budget(
+        model,
+        # Impossibly tight so the search never stops early -- every fraction
+        # in `custom_fractions` must actually be tried.
+        accuracy_budget=1e-12,
+        fractions=custom_fractions,
+        block_size=8,
+        calibration_data=calibration_data,
+    )
+    assert result.fractions_tried == list(custom_fractions)
+    for frac in result.fractions_tried:
+        assert frac in custom_fractions
+    # None of the default sweep's own intermediate values (e.g. 0.2, 0.3,
+    # 0.5, 0.75) were ever tried.
+    default_fractions = onnxsim.mixed_precision.DEFAULT_SEARCH_FRACTIONS
+    for frac in default_fractions:
+        if frac not in custom_fractions:
+            assert frac not in result.fractions_tried

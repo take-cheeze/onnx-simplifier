@@ -5,10 +5,17 @@ on:
     branches: ["master"]
     paths:
       - "scripts/convertmodel/**"
+      # test:qat-blocks (qat_blocks.test.mjs) reads this fixture straight out
+      # of onnxsim/, outside scripts/convertmodel/ -- so a rule-table change
+      # there (graph_grad.py/.cpp/.h regenerating it) needs to trigger this
+      # workflow too, or the JS test's own copy of the rule list can drift
+      # unnoticed until it fails on master.
+      - "onnxsim/qat_parity_fixtures.txt"
       - ".github/workflows/convertmodel-inference.yml"
   pull_request:
     paths:
       - "scripts/convertmodel/**"
+      - "onnxsim/qat_parity_fixtures.txt"
       - ".github/workflows/convertmodel-inference.yml"
   workflow_dispatch:
 
@@ -33,6 +40,9 @@ jobs:
       - name: Run trace-assembler unit test
         working-directory: scripts/convertmodel
         run: npm run test:trace
+      - name: Run node-reduction chart unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:node-reduction
       - name: Run MAC-metrics reader unit test
         working-directory: scripts/convertmodel
         run: npm run test:macs
@@ -42,12 +52,15 @@ jobs:
       - name: Run Hugging Face loader unit test
         working-directory: scripts/convertmodel
         run: npm run test:hf
+      - name: Run Hugging Face token storage unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:hftoken
       - name: Run Xet chunk-cache unit test
         working-directory: scripts/convertmodel
         run: npm run test:xet
-      - name: Run WebNN helper unit test
+      - name: Run issue-report URL builder unit test
         working-directory: scripts/convertmodel
-        run: npm run test:webnn
+        run: npm run test:issue
       - name: Run library-versions unit test
         working-directory: scripts/convertmodel
         run: npm run test:versions
@@ -57,15 +70,68 @@ jobs:
       - name: Run query-parameter unit test
         working-directory: scripts/convertmodel
         run: npm run test:query
+      - name: Run WebNN helper unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:webnn
+      - name: Run ORT log-capture unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:ortlog
       - name: Run CDN source-of-truth unit test
         working-directory: scripts/convertmodel
         run: npm run test:cdn
       - name: Run input-fill helper unit test
         working-directory: scripts/convertmodel
         run: npm run test:fill
+      - name: Run tokenizer-family resolution unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:tokenize
+      - name: Run Hugging Face sample-datasets unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:hfdata
+      - name: Run sample-inputs unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:sample
+      - name: Run output-classification unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:classify
+      - name: Run quantization-risk-estimate unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:quantize-risk
+      - name: Run browser-calibration unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:quantize-cal
+      - name: Run QAT block-discovery unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:qat-blocks
+      - name: Run QAT fine-tune loop unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:qat-finetune
+      - name: Run QAT loop vs. onnxruntime-web parity test (wasm EP)
+        working-directory: scripts/convertmodel
+        run: npm run test:qat-loop
       - name: Run inference smoke test (wasm EP)
         working-directory: scripts/convertmodel
         run: npm run test:inference
       - name: Run before/after comparison test (wasm EP)
         working-directory: scripts/convertmodel
         run: npm run test:compare
+      # Runs the committed QAT step-graph fixtures through onnxruntime-web and
+      # prints which execution providers actually executed the operators
+      # onnxsim/qat_graph.py's EP_FRIENDLY_OPS claims coverage for. wasm is the
+      # only EP a headless runner can reach, and the only one this asserts;
+      # WebGPU and WebNN are attempted and reported as unreached. Set
+      # ORT_REQUIRE=wasm,webgpu on a runner that has a GPU to make WebGPU a
+      # hard requirement there instead.
+      - name: Run step-graph EP coverage test (wasm EP; webgpu/webnn reported)
+        working-directory: scripts/convertmodel
+        run: npm run test:stepgraph
+      # Regression test for a real intermittent failure in the (browser-only,
+      # not run here) webgpu_hf_demo.test.mjs: replays step_qat_hf_demo.onnx
+      # against a deterministic adversarial input (webgpu_hf_demo_adversarial_x.json)
+      # whose untrained forward pass already lands within float32 precision
+      # of the target, and checks that a naive first/last endpoint comparison
+      # would fail for it while the windowed-average comparison both files
+      # now use correctly passes. Plain Node/wasm, no browser or GPU needed.
+      - name: Run HF demo loss-check regression test (wasm EP)
+        working-directory: scripts/convertmodel
+        run: npm run test:hf-demo-loss-check

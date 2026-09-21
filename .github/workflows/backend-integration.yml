@@ -1,26 +1,41 @@
 name: Backend Integration
 
 # End-to-end regression tests that feed onnxsim's simplified output into other
-# ONNX-consuming compiler/runtime stacks (Apache TVM, nncase, Halide) or
-# quantize-then-simplify pipelines (NVIDIA ModelOpt) — tests/test_tvm_integration.py,
-# tests/test_nncase_integration.py, tests/test_halide_integration.py,
-# tests/test_modelopt_integration.py. See docs/dlpack-executor.md, which frames
+# ONNX-consuming compiler/runtime stacks (Apache TVM, Halide, tinygrad,
+# PyTorch via onnx2torch, Apple's MLX), quantize-then-simplify pipelines
+# (NVIDIA ModelOpt), or a deployment toolbox's own backend runtime wrapper
+# (OpenMMLab mmdeploy), or a JAX/Flax ONNX frontend (jax2onnx) —
+# tests/test_tvm_integration.py,
+# tests/test_halide_integration.py, tests/test_tinygrad_integration.py,
+# tests/test_torch_integration.py, tests/test_mlx_integration.py,
+# tests/test_modelopt_integration.py, tests/test_mmdeploy_integration.py,
+# tests/test_jax_export_integration.py, tests/test_jax_real_model_integration.py,
+# tests/test_bev_models_torch_e2e.py, tests/test_optimum_export_deploy.py,
+# tests/test_export_transformers.py, tests/test_tpu_mlir_integration.py.
+# See docs/dlpack-executor.md, which frames
 # the DLPack executor boundary as an "embeddability" seam for stacks like these.
+# The xnnpack job below is the odd one out: it exercises
+# GetXnnpackModelExecutor() (onnxsim/xnnpack_executor_test.cpp) directly via a
+# native C++ build with ONNXSIM_BUILTIN_XNNPACK=ON, not a Python wheel, so it
+# does not depend on the `build` job below.
 #
-# These four checks used to live in their own workflow files
-# (tvm-integration.yml, nncase-integration.yml, halide-integration.yml,
-# modelopt-integration.yml), each independently building an identical cp312
-# manylinux wheel from the same commit via cibuildwheel -- on a PR touching
-# onnx_simplifier.py/onnxsim.cpp, or every day at the shared 07:00 UTC cron,
-# that meant 4 redundant wheel builds in parallel. Merged here into one
-# workflow: the wheel is built once and shared with all four test jobs,
-# exactly like model-regression.yml already does for its shards.
+# These checks used to live in their own workflow files (tvm-integration.yml,
+# halide-integration.yml, modelopt-integration.yml),
+# each independently building an identical cp312 manylinux wheel from the same
+# commit via cibuildwheel -- on a PR touching onnx_simplifier.py/onnxsim.cpp,
+# or every day at the shared 07:00 UTC cron, that meant redundant wheel builds
+# in parallel. Merged here into one workflow: the wheel is built once and
+# shared with every test job, exactly like model-regression.yml already does
+# for its shards.
 #
-# None of apache-tvm / nncase / halide / nvidia-modelopt are part of onnxsim's
-# test requirements (nncase needs the .NET runtime; modelopt drags in torch +
-# CUDA wheels), so this runs in its own workflow instead of the build-and-test
-# matrix. Runs on PRs that touch the harness or the simplifier, on a daily
-# schedule to catch new releases of the downstream tools, and on demand.
+# None of apache-tvm / halide / tinygrad / torch+onnx2torch / mlx /
+# nvidia-modelopt / mmdeploy / jax2onnx are part of onnxsim's test
+# requirements (modelopt, the torch job,
+# mmdeploy, and jax2onnx all drag in torch/jax + CUDA wheels), so this runs
+# in its own workflow instead of the build-and-test matrix. Runs on PRs that
+# touch the harness or the simplifier,
+# on a daily schedule to catch new releases of the downstream tools, and on
+# demand.
 
 on:
   schedule:
@@ -29,13 +44,32 @@ on:
   pull_request:
     paths:
       - "tests/test_tvm_integration.py"
-      - "tests/test_nncase_integration.py"
       - "tests/test_halide_integration.py"
+      - "tests/test_tinygrad_integration.py"
+      - "tests/test_torch_integration.py"
+      - "tests/test_mlx_integration.py"
       - "tests/test_modelopt_integration.py"
+      - "tests/test_mmdeploy_integration.py"
+      - "tests/test_jax_export_integration.py"
+      - "tests/test_jax_real_model_integration.py"
+      - "tests/test_bev_models_torch_e2e.py"
+      - "tests/_bev_torch_custom_ops.py"
+      - "tests/test_optimum_export_deploy.py"
+      - "tests/test_export_transformers.py"
+      - "tests/test_tpu_mlir_integration.py"
+      - "onnxsim/transformers_export.py"
+      - "onnxsim/passes/rewrite_msdeformattn_to_gridsample.h"
+      - "onnxsim/passes/rewrite_deform_conv_to_gather.h"
+      - "onnxsim/passes/rewrite_trt_batched_nms.h"
       - ".github/workflows/backend-integration.yml"
       - "onnxsim/onnx_simplifier.py"
       - "onnxsim/onnxsim.cpp"
       - "docs/dlpack-executor.md"
+      - "onnxsim/onnx_to_xnnpack_subgraph.h"
+      - "onnxsim/onnx_to_xnnpack_subgraph.cpp"
+      - "onnxsim/xnnpack_executor.cpp"
+      - "onnxsim/xnnpack_executor_test.cpp"
+      - "cmake/build_xnnpack.cmake"
 
 concurrency:
   group: backend-integration-${{ github.ref }}
@@ -60,7 +94,7 @@ jobs:
           fetch-depth: 0
       - uses: mozilla-actions/sccache-action@v0.0.11
       - name: Build cp312 wheel
-        uses: pypa/cibuildwheel@v4.2.0
+        uses: pypa/cibuildwheel@v4.2.1
         env:
           CIBW_BUILD: "cp312-manylinux_x86_64"
           CIBW_ARCHS: native
@@ -105,44 +139,117 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: pytest -v "$GITHUB_WORKSPACE/tests/test_tvm_integration.py"
 
-  nncase:
-    name: Simplify and run on nncase
-    needs: build
+  tpu_mlir:
+    name: Simplify and run on tpu-mlir
+    # No `needs: build`: unlike every other job here, this one cannot use the
+    # shared onnxsim-wheel-backend artifact at all -- that wheel is built
+    # cp312-abi3 (see the `build` job's CIBW_BUILD above), and abi3 wheels are
+    # forward-compatible only (a cp312-abi3 wheel never installs on 3.10).
+    # tpu_mlir's own wheel is hard-pinned to Python 3.10
+    # (python_requires=">=3.10,<3.11" -- its compiled extensions are built
+    # only for that ABI), and onnxsim's pyproject.toml separately declares
+    # requires-python = ">=3.11", so no single prebuilt onnxsim wheel can ever
+    # satisfy both at once. That floor is a packaging/release-matrix choice,
+    # not a technical one, though: onnxsim's C++ extension (nanobind +
+    # vendored onnx/onnx-optimizer) builds and runs correctly under 3.10 when
+    # built directly against it (confirmed locally) -- so this job builds
+    # onnxsim from source against its own Python 3.10 instead of installing
+    # any prebuilt wheel, with `--ignore-requires-python` to bypass the
+    # declared (but not technically enforced) floor.
+    #
+    # tpu-mlir's own setup.py declares platforms="unbuntu22.04": its compiled
+    # tpuc-opt/pymlir native extensions are linked against Ubuntu 22.04's
+    # glibc/libstdc++ and segfault on a newer ABI (confirmed directly against
+    # ubuntu-24.04, the OS every other job in this workflow runs on -- with or
+    # without LD_LIBRARY_PATH tricks to mix vendored and host libraries: using
+    # the full vendored lib/third_party crashes any *freshly spawned* process
+    # (tpuc-opt shells out via os.system, and even /bin/sh itself fails to
+    # resolve GLIBC_2.38 against the vendored, older libc.so.6 it pulls in
+    # via LD_LIBRARY_PATH), while excluding just the vendored glibc/libstdc++
+    # in favor of the host's own makes tpuc-opt itself segfault outright (an
+    # ABI mismatch, not a missing symbol). A container pinned to the actual
+    # declared OS sidesteps this entirely, and is more durable than pinning a
+    # runs-on: ubuntu-22.04 runner label, since GitHub has been retiring older
+    # ubuntu-*.04 runner images over time.
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    container: ubuntu:22.04
+    timeout-minutes: 60
     steps:
+      # The bare ubuntu:22.04 image has neither git, Python, nor a C compiler
+      # -- actions/checkout needs the former (it exec's a real git binary
+      # inside the container, unlike the runner-hosted jobs above where it's
+      # preinstalled). ubuntu:22.04 ships Python 3.10 as its default python3,
+      # exactly the one version tpu_mlir's wheel supports
+      # (python_requires=">=3.10,<3.11"). build-essential + python3-dev are
+      # needed both for pycocotools (a tpu_mlir[onnx] dependency with no
+      # prebuilt wheel for this platform, compiling a Cython extension
+      # against Python.h, not shipped by the bare python3 apt package) and
+      # for building onnxsim's own C++ extension below.
+      - name: Install git + Python 3.10 + build tools
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends git ca-certificates python3 python3-pip python3-venv python3-dev build-essential
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
-      - uses: actions/download-artifact@v8
-        with:
-          name: onnxsim-wheel-backend
-          path: wheelhouse
-      # nncase is a .NET application and needs the .NET 7.0 runtime to load
-      # Nncase.Compiler.dll (hostfxr is found via DOTNET_ROOT).
-      - name: Install .NET 7.0 runtime
+          submodules: recursive
+          fetch-depth: 0
+      # tpu_mlir's own [onnx] extra pins the only onnx/onnxruntime/onnxsim/
+      # numpy/protobuf combination it ships pre-verified against
+      # (onnx==1.14.1, onnxruntime==1.16.3, onnxsim==0.4.17, numpy==1.24.3,
+      # protobuf==3.20.3) -- installing plain `tpu_mlir` alone resolves a
+      # numpy/protobuf pair current `onnx` can't even import against
+      # (ml_dtypes needs numpy>=2, tpu_mlir's compiled extensions need
+      # numpy==1.24.3 exactly). Installing the [onnx] extra first gets a
+      # mutually-compatible baseline; the onnxsim build below then uses
+      # --no-deps so it doesn't drag its own numpy/onnx resolution back in
+      # and disturb that pinned set. transform.OnnxOpt (tpu_mlir's own
+      # runtime-value-driven ConstantFolding pass, run immediately around
+      # every onnxsim.simplify() call -- see the test module's docstring)
+      # unconditionally imports torch, which isn't part of the [onnx] extra.
+      # tpu_mlir.python.utils.mlir_shell (imported transitively by
+      # tools.model_transform, which the integration test imports directly)
+      # unconditionally imports psutil, which [onnx] also doesn't pull in.
+      - name: Install tpu_mlir[onnx] + torch
         run: |
-          curl -sSL https://dot.net/v1/dotnet-install.sh -o dotnet-install.sh
-          chmod +x dotnet-install.sh
-          ./dotnet-install.sh --runtime dotnet --channel 7.0 --install-dir "$HOME/.dotnet"
-          echo "DOTNET_ROOT=$HOME/.dotnet" >> "$GITHUB_ENV"
-          echo "$HOME/.dotnet" >> "$GITHUB_PATH"
-      - name: Install onnxsim wheel + nncase
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --timeout 120 --retries 5 "tpu_mlir[onnx]"
+          python3 -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+          python3 -m pip install pytest psutil
+      # onnxsim's own onnx.inliner import (added in onnx 1.15) doesn't exist
+      # in tpu_mlir[onnx]'s pinned onnx==1.14.1, so bump onnx specifically --
+      # 1.17.0 is confirmed (locally) to still leave numpy==1.24.3/
+      # protobuf==3.20.3 untouched (unlike current onnx, whose ml_dtypes
+      # dependency wants numpy>=2). onnxsim's own onnxsim/deepseek_fp8.py also
+      # imports ml_dtypes unconditionally, but doesn't declare it as a
+      # dependency (it normally rides in transitively via onnx) -- pinned
+      # here explicitly at <0.6, the last line still importable under
+      # numpy==1.24.3 (0.6.0 requires numpy>=2, confirmed locally).
+      - name: Bump onnx for onnxsim's onnx.inliner import, pin a numpy-1.24-compatible ml_dtypes
+        run: python3 -m pip install "onnx==1.17.0" "ml_dtypes==0.5.1"
+      # Builds onnxsim's C++ extension directly against this container's
+      # Python 3.10 (see the job-level comment above for why no prebuilt
+      # wheel can be used here). Mirrors the `build` job's own
+      # CIBW_BEFORE_BUILD/CIBW_ENVIRONMENT: same build deps, same CMAKE_ARGS.
+      # --no-build-isolation reuses the nanobind/cmake/ninja installed here
+      # instead of pip silently fetching its own copies; --no-deps keeps
+      # tpu_mlir's pinned onnx/numpy alone; --ignore-requires-python bypasses
+      # the declared (but not technically enforced, see above) 3.11 floor.
+      - name: Build onnxsim from source against Python 3.10 (no prebuilt wheel fits)
+        env:
+          CMAKE_ARGS: -DONNX_USE_PROTOBUF_SHARED_LIBS=OFF
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install pytest nncase
-          python -m pip install wheelhouse/*.whl
-      - name: Verify the installed wheel is used (not the source tree)
+          python3 -m pip install cmake ninja setuptools "nanobind>=2.12.0"
+          python3 -m pip install --no-build-isolation --no-deps --ignore-requires-python .
+      - name: Verify the built extension is used (not a stray source-tree import)
         working-directory: ${{ runner.temp }}
         run: |
-          python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
-          python -c "import nncase; print('nncase', nncase.__file__)"
+          python3 -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+          python3 -c "import tpu_mlir; print('tpu_mlir', tpu_mlir.__file__)"
       # Run from a neutral directory so the repo root's ./onnxsim source package
       # (without the compiled extension) does not shadow the installed wheel.
-      - name: Run nncase integration tests
+      - name: Run tpu-mlir integration tests
         working-directory: ${{ runner.temp }}
-        run: pytest -v "$GITHUB_WORKSPACE/tests/test_nncase_integration.py"
+        run: python3 -m pytest -v "$GITHUB_WORKSPACE/tests/test_tpu_mlir_integration.py"
 
   halide:
     name: Simplify and run on Halide
@@ -174,6 +281,180 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: pytest -v "$GITHUB_WORKSPACE/tests/test_halide_integration.py"
 
+  tinygrad:
+    name: Simplify and run on tinygrad
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-backend
+          path: wheelhouse
+      - name: Install onnxsim wheel + tinygrad
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest tinygrad
+          python -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+          python -c "import importlib.metadata as m, tinygrad; print('tinygrad', m.version('tinygrad'), tinygrad.__file__)"
+      # Run from a neutral directory so the repo root's ./onnxsim source package
+      # (without the compiled extension) does not shadow the installed wheel.
+      - name: Run tinygrad integration tests
+        working-directory: ${{ runner.temp }}
+        run: pytest -v "$GITHUB_WORKSPACE/tests/test_tinygrad_integration.py"
+
+  torch:
+    name: Simplify and run on PyTorch (onnx2torch)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-backend
+          path: wheelhouse
+      - name: Install onnxsim wheel + torch + onnx2torch
+        run: |
+          python -m pip install --upgrade pip
+          # torch and torchvision must be installed together from the CPU-only
+          # wheel index so they're a matched build (mismatched ABIs raise
+          # "operator torchvision::nms does not exist" on import). onnx2torch
+          # depends on both; --no-deps keeps its install from re-resolving
+          # torchvision off the default index and clobbering that pairing.
+          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install pytest onnx
+          python -m pip install --no-deps onnx2torch
+          python -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+          python -c "import torch, onnx2torch; print('torch', torch.__version__, 'onnx2torch', onnx2torch.__file__)"
+      # Run from a neutral directory so the repo root's ./onnxsim source package
+      # (without the compiled extension) does not shadow the installed wheel.
+      - name: Run torch integration tests
+        working-directory: ${{ runner.temp }}
+        run: pytest -v "$GITHUB_WORKSPACE/tests/test_torch_integration.py"
+
+  bev_torch_e2e:
+    name: BEV custom-op rewrites (torch.onnx.export) E2E
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-backend
+          path: wheelhouse
+      - name: Install onnxsim wheel + torch + onnxruntime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install pytest onnxruntime
+          python -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+          python -c "import torch; print('torch', torch.__version__)"
+      # Run from a neutral directory so the repo root's ./onnxsim source
+      # package (without the compiled extension) does not shadow the
+      # installed wheel. pytest's own "prepend" import mode still puts
+      # tests/ (the test file's own directory) on sys.path from the
+      # absolute path alone, so the sibling helper import (`from
+      # _bev_torch_custom_ops import ...`, same convention as
+      # tests/test_coreml_compat.py's `_local_import` helper) resolves fine.
+      - name: Run BEV torch E2E tests
+        working-directory: ${{ runner.temp }}
+        run: pytest -v "$GITHUB_WORKSPACE/tests/test_bev_models_torch_e2e.py"
+
+  optimum:
+    name: Export via HF Optimum, simplify, and deploy
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-backend
+          path: wheelhouse
+      # optimum-onnx (a very new split-out of what used to be optimum's own
+      # onnxruntime extra) declares optimum/transformers as its own
+      # dependencies, so installing it alone is enough to pull both in.
+      - name: Install onnxsim wheel + torch + transformers/optimum + onnxruntime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install pytest transformers optimum-onnx onnxruntime
+          python -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+          python -c "import optimum.exporters.onnx, optimum.onnxruntime; print('optimum ok')"
+      # Run from a neutral directory so the repo root's ./onnxsim source package
+      # (without the compiled extension) does not shadow the installed wheel.
+      - name: Run HF Optimum export/deploy integration tests
+        working-directory: ${{ runner.temp }}
+        run: |
+          pytest -v "$GITHUB_WORKSPACE/tests/test_optimum_export_deploy.py"
+          pytest -v "$GITHUB_WORKSPACE/tests/test_export_transformers.py"
+
+  mlx:
+    name: Simplify and run on MLX
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-backend
+          path: wheelhouse
+      - name: Install onnxsim wheel + mlx
+        run: |
+          python -m pip install --upgrade pip
+          # MLX's Linux wheel is a thin binding: the native backend (libmlx.so)
+          # is a separate package selected via extra, not bundled in bare
+          # `mlx` -- bare `mlx` fails to import ("libmlx.so: cannot open
+          # shared object file"). `[cpu]` pulls in the CPU backend, which runs
+          # on an ordinary runner with no GPU.
+          python -m pip install pytest "mlx[cpu]"
+          python -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+          python -c "import mlx.core as mx; print('mlx', mx.__file__, mx.default_device())"
+      # Run from a neutral directory so the repo root's ./onnxsim source package
+      # (without the compiled extension) does not shadow the installed wheel.
+      - name: Run MLX integration tests
+        working-directory: ${{ runner.temp }}
+        run: pytest -v "$GITHUB_WORKSPACE/tests/test_mlx_integration.py"
+
   modelopt:
     name: Quantize with ModelOpt and simplify
     needs: build
@@ -201,3 +482,142 @@ jobs:
       - name: Run ModelOpt integration tests
         working-directory: ${{ runner.temp }}
         run: pytest -v "$GITHUB_WORKSPACE/tests/test_modelopt_integration.py"
+
+  mmdeploy:
+    name: Simplify and run on mmdeploy's ONNXRuntime wrapper
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-backend
+          path: wheelhouse
+      # mmdeploy's PyPI release (1.3.1) still imports `mmcv.Config`, which
+      # `mmcv` dropped as of its 2.0 GA (it was only ever an mmcv 2.0.0rc-era
+      # back-compat alias for `mmengine.Config`) -- so it can't be imported
+      # next to any installable mmcv>=2.0. Install mmdeploy from its `main`
+      # branch instead, which has since moved to `mmengine.Config` directly.
+      # Its old-style setup.py also needs `pkg_resources` (removed from
+      # current setuptools) and, if torch is already importable while it
+      # builds, tries to compile its optional TorchScript custom-op
+      # extension (irrelevant to the plain ONNXRuntime backend used here, and
+      # not worth dragging a C++ toolchain into this job for) -- so install
+      # it with an older setuptools and *before* torch is even installed,
+      # which makes its setup.py skip that extension on its own.
+      - name: Install mmdeploy (from source, ahead of torch)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "setuptools<81"
+          python -m pip install --no-build-isolation "git+https://github.com/open-mmlab/mmdeploy.git"
+      - name: Install onnxsim wheel + torch + mmdeploy's own runtime deps
+        run: |
+          python -m pip install pytest
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install mmcv-lite mmengine onnxruntime onnxscript
+          python -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+          python -c "import mmdeploy; print('mmdeploy', mmdeploy.__version__)"
+      # Run from a neutral directory so the repo root's ./onnxsim source package
+      # (without the compiled extension) does not shadow the installed wheel.
+      - name: Run mmdeploy integration tests
+        working-directory: ${{ runner.temp }}
+        run: pytest -v "$GITHUB_WORKSPACE/tests/test_mmdeploy_integration.py"
+
+  jax:
+    name: Simplify ONNX exported from JAX/Flax (jax2onnx)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-backend
+          path: wheelhouse
+      # jax2onnx pulls in jax, flax, onnxruntime, and its own onnx/onnx-ir
+      # copies as ordinary dependencies -- no extra install step needed
+      # beyond it. transformers is only needed for
+      # test_jax_real_model_integration.py's real ViT/GPT-2 models, and only
+      # as `<5`: transformers 5.0 dropped its Flax model implementations
+      # entirely, so the newest transformers with FlaxViTModel /
+      # FlaxGPT2LMHeadModel still importable must be pinned explicitly here
+      # rather than left to just "transformers" resolving to latest. gemma
+      # is Google DeepMind's own actively-maintained Flax NNX package
+      # (that test's model needs onnxsim's rewrite_bool_where pass to even
+      # load on ORT -- see tests/test_rewrite_bool_where.py). jax2onnx
+      # 0.16.1's jax.core.Var()-construction plugin code
+      # (jax2onnx/plugins/jax/core/jit.py) hard-codes jax<0.11's 3-positional-
+      # argument Var.__init__ signature -- jax 0.11 (released 2026-09-04)
+      # dropped two of those positional args, so tracing through to_onnx()
+      # raises "TypeError: Var.__init__() takes 2 positional arguments but 4
+      # were given" before onnxsim ever sees the graph. Pinning gemma alone
+      # is NOT enough: gemma==3.3.0 has no upper bound on jax, so pip's
+      # resolver still picks jax>=0.11 to satisfy some *other* package in
+      # this same install (observed: gemma==3.3.0 + jax2onnx + transformers<5
+      # unpinned still resolved jax==0.11.1). jax/jaxlib must be pinned
+      # directly. Drop both pins once jax2onnx ships a fix for the newer jax
+      # Var() signature.
+      - name: Install onnxsim wheel + jax2onnx + transformers (Flax models) + gemma
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest jax2onnx "transformers<5" "gemma==3.3.0" "jax<0.11" "jaxlib<0.11"
+          python -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+          python -c "import jax, jax2onnx; print('jax', jax.__version__, 'jax2onnx', jax2onnx.__file__)"
+          python -c "import transformers; print('transformers', transformers.__version__, transformers.FlaxViTModel)"
+          python -c "import gemma; print('gemma', gemma.__version__)"
+      # Run from a neutral directory so the repo root's ./onnxsim source package
+      # (without the compiled extension) does not shadow the installed wheel.
+      - name: Run JAX export integration tests
+        working-directory: ${{ runner.temp }}
+        run: |
+          pytest -v "$GITHUB_WORKSPACE/tests/test_jax_export_integration.py"
+          pytest -v "$GITHUB_WORKSPACE/tests/test_jax_real_model_integration.py"
+
+  xnnpack:
+    name: XNNPACK ModelExecutor backend (native)
+    # No `needs: build`: this is a plain native C++ build (ONNXSIM_BUILTIN_ORT
+    # is left off entirely), not a consumer of the Python wheel the other jobs
+    # here share.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure
+        run: |
+          cmake -G Ninja -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
+            -DONNXSIM_BUILTIN_ORT=OFF \
+            -DONNXSIM_BUILTIN_XNNPACK=ON \
+            -DONNXSIM_TESTS=ON \
+            -DXNNPACK_BUILD_ALL_MICROKERNELS=OFF
+        # ALL_MICROKERNELS=OFF restricts XNNPACK to the host ISA instead of
+        # every ISA variant it can runtime-dispatch across -- fine here since
+        # this job only checks onnx_to_xnnpack_subgraph.cpp's lowering is
+        # correct, not that the resulting binary is portable across CPUs.
+      - name: Build
+        run: cmake --build build --target xnnpack_executor_test
+      - name: Run
+        run: ./build/xnnpack_executor_test

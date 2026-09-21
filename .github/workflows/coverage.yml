@@ -5,7 +5,6 @@ on:
     branches:
       - main
       - master
-  pull_request:
   workflow_dispatch:
 
 concurrency:
@@ -60,7 +59,7 @@ jobs:
       background: true
       run: |
         pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
-        pip install flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26
+        pip install flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26 sympy onnx-shape-inference
 
     - name: Build instrumented extension (editable)
       run: pip install --no-build-isolation -ve .
@@ -123,7 +122,7 @@ jobs:
       # ONNXSIM_ORT_HOME points at the cached, pre-extracted release below so the
       # native build never re-downloads it.
       ONNXSIM_PREBUILT_ORT: "1"
-      ONNXSIM_ORT_HOME: ${{ github.workspace }}/rust/prebuilt-ort/onnxruntime-linux-x64-1.28.0
+      ONNXSIM_ORT_HOME: ${{ github.workspace }}/rust/prebuilt-ort/onnxruntime-linux-x64-1.29.0
     steps:
       - uses: actions/checkout@v7
         with:
@@ -134,7 +133,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview
-      - uses: taiki-e/install-action@v2.86.5
+      - uses: taiki-e/install-action@v2.87.11
         with:
           tool: cargo-llvm-cov
       - name: Install build tools
@@ -146,7 +145,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: rust/prebuilt-ort
-          key: prebuilt-ort-linux-x64-1.28.0
+          key: prebuilt-ort-linux-x64-1.29.0
       - name: Download prebuilt ONNX Runtime
         if: steps.ort-cache.outputs.cache-hit != 'true'
         # Runs in ./rust (this job's default working-directory), so prebuilt-ort
@@ -155,7 +154,7 @@ jobs:
           mkdir -p prebuilt-ort
           curl -L --fail --silent --show-error \
             -o /tmp/onnxruntime.tgz \
-            https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-linux-x64-1.28.0.tgz
+            https://github.com/microsoft/onnxruntime/releases/download/v1.29.0/onnxruntime-linux-x64-1.29.0.tgz
           tar -xzf /tmp/onnxruntime.tgz -C prebuilt-ort
       # Build + run the tests under instrumentation, accumulating profiles across
       # both the default run and the native-only integration test, then render

@@ -20,9 +20,10 @@
                     input.disabled = false;
                     input.removeAttribute("title");
                 }
-                // The "Load from Hugging Face" controls share the same runtimes
-                // as the file picker, so enable them together.
-                for (const id of ["hf-model-select", "hf-model-input", "hf-load-button"]) {
+                // The "Load from Hugging Face" controls and the nanochat demo
+                // button share the same runtimes as the file picker, so enable
+                // them together.
+                for (const id of ["hf-model-select", "hf-model-input", "hf-load-button", "nanochat-demo-button"]) {
                     const el = document.getElementById(id);
                     if (el) {
                         el.disabled = false;
@@ -203,6 +204,13 @@
                             // List the converted model's dim_params ("after").
                             if (window.dimParamsShowAfter) {
                                 window.dimParamsShowAfter(data_url, result_name);
+                            }
+                            // List the converted model's custom WebGPU kernel
+                            // annotations ("after") -- simplify/optimize can
+                            // rename or fuse away an annotated node, so this
+                            // is not always the same list as "before".
+                            if (window.webgpuKernelsShowAfter) {
+                                window.webgpuKernelsShowAfter(data_url, result_name);
                             }
                             // Keep the converted model bytes around so the
                             // "Run inference" panel can run them (not just the

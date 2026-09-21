@@ -9,28 +9,85 @@
 #include <string>
 
 #include "onnxoptimizer/optimize.h"
+#include "passes/adpq.h"
+#include "passes/any_precision_llm.h"
+#include "passes/aqlm.h"
+#include "passes/attention_quantization.h"
 #include "passes/cross_layer_equalization.h"
+#include "passes/d2quant_dsq.h"
+#include "passes/deepseek_fp8.h"
+#include "passes/defuse_matmul_integer_to_float.h"
+#include "passes/dilated_conv_to_taps.h"
+#include "passes/double_quantization.h"
+#include "passes/drop_by_drop.h"
 #include "passes/dynamic_quantize_attention.h"
 #include "passes/dynamic_quantize_matmul.h"
 #include "passes/dynamic_quantize_matmul_integer_to_float.h"
 #include "passes/dynamic_quantize_ternary_matmul.h"
+#include "passes/eliminate_consecutive_idempotent_ops.h"
+#include "passes/eliminate_loop_with_const_trip_count.h"
 #include "passes/eliminate_nop_dropout.h"
+#include "passes/eliminate_optional_get_element.h"
+#include "passes/eliminate_optional_has_element.h"
 #include "passes/eliminate_reshape_around_elementwise.h"
+#include "passes/eliminate_reshape_family_on_constant.h"
+#include "passes/eliminate_sequence_at_construct.h"
+#include "passes/eliminate_sequence_length_construct.h"
+#include "passes/explicit_auto_pad.h"
+#include "passes/explicit_conv_padding.h"
+#include "passes/float16_to_float32.h"
+#include "passes/fp6_llm.h"
 #include "passes/fuse_add_bias_into_conv.h"
 #include "passes/fuse_attention.h"
 #include "passes/fuse_bn_into_conv.h"
 #include "passes/fuse_consecutive_mul.h"
+#include "passes/fuse_consecutive_reduce.h"
+#include "passes/fuse_consecutive_reshapes.h"
 #include "passes/fuse_consecutive_unsqueezes.h"
 #include "passes/fuse_gelu.h"
 #include "passes/fuse_gqa.h"
 #include "passes/fuse_layer_norm.h"
+#include "passes/fuse_matmul_add_bias_into_gemm.h"
 #include "passes/fuse_matmul_add_bias_into_gemm_batched.h"
+#include "passes/fuse_matmul_into_conv.h"
 #include "passes/fuse_mul_into_conv.h"
 #include "passes/fuse_pad_into_pool.h"
 #include "passes/fuse_preceding_mul_into_conv.h"
 #include "passes/fuse_qkv.h"
+#include "passes/fuse_reduce_sum_into_conv.h"
+#include "passes/fuse_reshape_family.h"
 #include "passes/fuse_rms_norm.h"
 #include "passes/fuse_rope.h"
+#include "passes/fuse_split_gather_concat.h"
+#include "passes/gemm_transa_to_transpose.h"
+#include "passes/gguf_legacy_quant.h"
+#include "passes/gguf_legacy_quant_5bit.h"
+#include "passes/gguf_q2_k.h"
+#include "passes/gguf_q3_k.h"
+#include "passes/gguf_q4_k.h"
+#include "passes/gguf_q5_k.h"
+#include "passes/gguf_q6_k.h"
+#include "passes/gguf_q8_0.h"
+#include "passes/gguf_ternary_quant.h"
+#include "passes/hqq.h"
+#include "passes/ibert_gelu.h"
+#include "passes/ibert_softmax.h"
+#include "passes/icquant.h"
+#include "passes/if4_quantization.h"
+#include "passes/intactkv.h"
+#include "passes/iq4_nl.h"
+#include "passes/kbvq_moe.h"
+#include "passes/kmeans_quantization.h"
+#include "passes/leptoquant.h"
+#include "passes/llm_fp4.h"
+#include "passes/lo_bcq.h"
+#include "passes/magnitude_pruning.h"
+#include "passes/maxpool_rowmajor_when_indices_unused.h"
+#include "passes/neg_to_mul.h"
+#include "passes/nf4.h"
+#include "passes/nvfp4_quantization.h"
+#include "passes/olive.h"
+#include "passes/pow2_to_mul.h"
 #include "passes/qoperator_quantize_activation.h"
 #include "passes/qoperator_quantize_concat.h"
 #include "passes/qoperator_quantize_conv.h"
@@ -40,9 +97,27 @@
 #include "passes/qoperator_quantize_pool.h"
 #include "passes/qoperator_quantize_softmax.h"
 #include "passes/qoperator_quantize_where.h"
+#include "passes/qoq.h"
 #include "passes/quantize_bf16.h"
 #include "passes/quantize_fp16.h"
 #include "passes/quantize_fp8.h"
+#include "passes/quarot.h"
+#include "passes/quip_sharp.h"
+#include "passes/rank0_to_rank1.h"
+#include "passes/rewrite_arg_reduce_select_last_index.h"
+#include "passes/rewrite_bev_pool_to_scatter.h"
+#include "passes/rewrite_bool_where.h"
+#include "passes/rewrite_deform_conv_to_gather.h"
+#include "passes/rewrite_gather_over_concat.h"
+#include "passes/rewrite_gatherelements_to_gather.h"
+#include "passes/rewrite_gathernd_to_gather.h"
+#include "passes/rewrite_gridsample_to_gather.h"
+#include "passes/rewrite_implicit_broadcast.h"
+#include "passes/rewrite_msdeformattn_to_gridsample.h"
+#include "passes/rewrite_tensor_scatter_to_scatter_elements.h"
+#include "passes/rewrite_trt_batched_nms.h"
+#include "passes/rewrite_trt_batched_rotated_nms.h"
+#include "passes/split_large_gather.h"
 #include "passes/static_quantize_conv.h"
 #include "passes/static_quantize_int16_conv.h"
 #include "passes/static_quantize_int16_matmul.h"
@@ -56,6 +131,8 @@
 #include "passes/weight_only_quantize_int8_block_matmul.h"
 #include "passes/weight_only_quantize_matmul.h"
 #include "passes/weight_only_quantize_matmul_nbits.h"
+#include "passes/weight_only_quantize_mxfp4_matmul.h"
+#include "passes/zeroquant.h"
 
 namespace onnxsim {
 
@@ -90,22 +167,85 @@ void RegisterCustomOptimizerPasses() {
     auto& registry = ONNX_NAMESPACE::optimization::Optimizer::passes;
 
     // onnxsim-only rewrites (no built-in of the same name today).
+    RegisterOrReplace<p::ADPQ>(registry);
+    RegisterOrReplace<p::AnyPrecisionLlm>(registry);
+    RegisterOrReplace<p::AQLM>(registry);
+    RegisterOrReplace<p::DropByDrop>(registry);
+    RegisterOrReplace<p::LoBcq>(registry);
+    RegisterOrReplace<p::QuipSharp>(registry);
+    RegisterOrReplace<p::AttentionQuantization>(registry);
+    RegisterOrReplace<p::IntactKv>(registry);
+    RegisterOrReplace<p::KbvqMoe>(registry);
+    RegisterOrReplace<p::ZeroQuant>(registry);
+    RegisterOrReplace<p::LlmFp4>(registry);
+    RegisterOrReplace<p::Qoq>(registry);
+    RegisterOrReplace<p::D2QuantDsq>(registry);
     RegisterOrReplace<p::CrossLayerEqualization>(registry);
+    RegisterOrReplace<p::DeepSeekFp8>(registry);
+    RegisterOrReplace<p::DefuseMatMulIntegerToFloat>(registry);
+    RegisterOrReplace<p::DilatedConvToTaps>(registry);
+    RegisterOrReplace<p::DoubleQuantization>(registry);
     RegisterOrReplace<p::DynamicQuantizeAttention>(registry);
     RegisterOrReplace<p::DynamicQuantizeMatMul>(registry);
     RegisterOrReplace<p::DynamicQuantizeMatMulIntegerToFloat>(registry);
     RegisterOrReplace<p::DynamicQuantizeTernaryMatMul>(registry);
+    RegisterOrReplace<p::EliminateLoopWithConstTripCount>(registry);
+    RegisterOrReplace<p::EliminateOptionalGetElement>(registry);
+    RegisterOrReplace<p::EliminateOptionalHasElement>(registry);
     RegisterOrReplace<p::EliminateReshapeAroundElementwise>(registry);
+    RegisterOrReplace<p::EliminateReshapeFamilyOnConstant>(registry);
+    RegisterOrReplace<p::EliminateSequenceAtConstruct>(registry);
+    RegisterOrReplace<p::EliminateSequenceLengthConstruct>(registry);
+    RegisterOrReplace<p::ExplicitAutoPad>(registry);
+    RegisterOrReplace<p::ExplicitConvPadding>(registry);
+    RegisterOrReplace<p::Float16ToFloat32Pass>(registry);
+    RegisterOrReplace<p::Fp6Llm>(registry);
     RegisterOrReplace<p::FuseAttention>(registry);
     RegisterOrReplace<p::FuseConsecutiveMul>(registry);
+    RegisterOrReplace<p::FuseConsecutiveReduce>(registry);
+    RegisterOrReplace<p::FuseConsecutiveReshapes>(registry);
     RegisterOrReplace<p::FuseGelu>(registry);
     RegisterOrReplace<p::FuseGQA>(registry);
     RegisterOrReplace<p::FuseLayerNorm>(registry);
     RegisterOrReplace<p::FuseMatMulAddBiasIntoGemmBatched>(registry);
+    RegisterOrReplace<p::FuseMatMulIntoConv>(registry);
     RegisterOrReplace<p::FuseMulIntoConv>(registry);
     RegisterOrReplace<p::FusePrecedingMulIntoConv>(registry);
+    RegisterOrReplace<p::FuseReduceSumIntoConv>(registry);
+    RegisterOrReplace<p::FuseReshapeFamily>(registry);
     RegisterOrReplace<p::FuseRMSNorm>(registry);
     RegisterOrReplace<p::FuseRope>(registry);
+    RegisterOrReplace<p::FuseSplitGatherConcat>(registry);
+    RegisterOrReplace<p::GemmTransAToTranspose>(registry);
+    RegisterOrReplace<p::GgufQ2K>(registry);
+    RegisterOrReplace<p::GgufQ3K>(registry);
+    RegisterOrReplace<p::GgufQ4K>(registry);
+    RegisterOrReplace<p::GgufQ4_0>(registry);
+    RegisterOrReplace<p::GgufQ4_1>(registry);
+    RegisterOrReplace<p::GgufQ5K>(registry);
+    RegisterOrReplace<p::GgufQ5_0>(registry);
+    RegisterOrReplace<p::GgufQ5_1>(registry);
+    RegisterOrReplace<p::GgufQ6K>(registry);
+    RegisterOrReplace<p::GgufQ8_0>(registry);
+    RegisterOrReplace<p::GgufTernaryQuant>(registry);
+    RegisterOrReplace<p::HQQ>(registry);
+    RegisterOrReplace<p::IBertGelu>(registry);
+    RegisterOrReplace<p::IBertSoftmax>(registry);
+    RegisterOrReplace<p::ICQuant>(registry);
+    RegisterOrReplace<p::IF4>(registry);
+    RegisterOrReplace<p::IQ4NL>(registry);
+    RegisterOrReplace<p::KMeansQuant>(registry);
+    RegisterOrReplace<p::LeptoQuant>(registry);
+    RegisterOrReplace<p::MagnitudePruningAttention>(registry);
+    RegisterOrReplace<p::MagnitudePruningConv>(registry);
+    RegisterOrReplace<p::MagnitudePruningGlobal>(registry);
+    RegisterOrReplace<p::MagnitudePruningMatMul>(registry);
+    RegisterOrReplace<p::MaxPoolRowMajorWhenIndicesUnused>(registry);
+    RegisterOrReplace<p::NegToMul>(registry);
+    RegisterOrReplace<p::NF4>(registry);
+    RegisterOrReplace<p::NVFP4Quantization>(registry);
+    RegisterOrReplace<p::Olive>(registry);
+    RegisterOrReplace<p::Pow2ToMul>(registry);
     RegisterOrReplace<p::QOperatorQuantizeActivation>(registry);
     RegisterOrReplace<p::QOperatorQuantizeConcat>(registry);
     RegisterOrReplace<p::QOperatorQuantizeConv>(registry);
@@ -118,6 +258,22 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::QuantizeBf16Pass>(registry);
     RegisterOrReplace<p::QuantizeFp16Pass>(registry);
     RegisterOrReplace<p::QuantizeFp8Pass>(registry);
+    RegisterOrReplace<p::Quarot>(registry);
+    RegisterOrReplace<p::Rank0ToRank1>(registry);
+    RegisterOrReplace<p::RewriteArgReduceSelectLastIndex>(registry);
+    RegisterOrReplace<p::RewriteBevPoolToScatter>(registry);
+    RegisterOrReplace<p::RewriteBoolWhere>(registry);
+    RegisterOrReplace<p::RewriteDeformConvToGather>(registry);
+    RegisterOrReplace<p::RewriteGatherElementsToGather>(registry);
+    RegisterOrReplace<p::RewriteGatherNDToGather>(registry);
+    RegisterOrReplace<p::RewriteGatherOverConcat>(registry);
+    RegisterOrReplace<p::RewriteGridSampleToGather>(registry);
+    RegisterOrReplace<p::RewriteImplicitBroadcast>(registry);
+    RegisterOrReplace<p::RewriteMSDeformAttnToGridSample>(registry);
+    RegisterOrReplace<p::RewriteTensorScatterToScatterElements>(registry);
+    RegisterOrReplace<p::RewriteTRTBatchedNMS>(registry);
+    RegisterOrReplace<p::RewriteTRTBatchedRotatedNMS>(registry);
+    RegisterOrReplace<p::SplitLargeGather>(registry);
     RegisterOrReplace<p::StaticQuantizeConv>(registry);
     RegisterOrReplace<p::StaticQuantizeInt16Conv>(registry);
     RegisterOrReplace<p::StaticQuantizeInt16MatMul>(registry);
@@ -131,16 +287,19 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::WeightOnlyQuantizeInt8BlockMatMul>(registry);
     RegisterOrReplace<p::WeightOnlyQuantizeMatMul>(registry);
     RegisterOrReplace<p::WeightOnlyQuantizeMatMulNBits>(registry);
+    RegisterOrReplace<p::WeightOnlyQuantizeMXFP4MatMul>(registry);
 
     // onnxsim's patched versions of built-in onnxoptimizer passes. These
     // overwrite the registry entries the submodule registers under the same
     // names, so onnxsim's fixes/extensions (ConvTranspose fusions, no-op
     // opset-12 Dropout, zero-padding MaxPool, ...) apply while the fork itself
     // tracks upstream onnxoptimizer.
+    RegisterOrReplace<p::EliminateConsecutiveIdempotentOps>(registry);
     RegisterOrReplace<p::EliminateNopDropout>(registry);
     RegisterOrReplace<p::FuseAddBiasIntoConv>(registry);
     RegisterOrReplace<p::FuseBNIntoConv>(registry);
     RegisterOrReplace<p::FuseConsecutiveUnsqueezes>(registry);
+    RegisterOrReplace<p::FuseMatMulAddBiasIntoGemm>(registry);
     RegisterOrReplace<p::FusePadIntoPool>(registry);
     RegisterOrReplace<p::FuseQKV>(registry);
   });

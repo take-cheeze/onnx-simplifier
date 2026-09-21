@@ -50,7 +50,7 @@ jobs:
       # X2Paddle 1.6.0 needs onnx<1.16, which has no cp312 wheels on some
       # platforms; build the onnxsim wheel for cp311 to match the shard runtime.
       - name: Build cp311 wheel
-        uses: pypa/cibuildwheel@v4.2.0
+        uses: pypa/cibuildwheel@v4.2.1
         env:
           CIBW_BUILD: "cp311-manylinux_x86_64"
           CIBW_ARCHS: native
@@ -110,7 +110,8 @@ jobs:
           # X2Paddle 1.6.0 targets onnx<1.16 (onnx.mapping) and opset <= 15.
           # six and requests are undeclared x2paddle runtime deps that its
           # conversion path pulls in (x2paddle/core/program.py imports six and,
-          # via x2paddle.utils, requests); rich is an onnxsim runtime dep. All
+          # via x2paddle.utils, requests); rich is an optional onnxsim dep, kept
+          # here so the regression run exercises onnxsim's rich output path. All
           # are installed explicitly because the onnxsim wheel below goes in with
           # --no-deps. onnxslim is the comparison arm.
           python -m pip install "paddlepaddle>=2.5" "x2paddle==1.6.0" "onnx<1.16" \

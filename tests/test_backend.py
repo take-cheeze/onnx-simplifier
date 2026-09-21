@@ -7,7 +7,7 @@ reference evaluator instead of requiring / auto-installing onnxruntime.
 import numpy as np
 import onnx
 import pytest
-from onnx import TensorProto, helper, numpy_helper
+from onnx import parser
 
 import onnxsim
 from onnxsim import backend
@@ -15,19 +15,16 @@ from onnxsim import backend
 
 def _make_foldable_model() -> onnx.ModelProto:
     """A model whose ``a + b`` can be constant-folded, then added to input."""
-    a = numpy_helper.from_array(np.ones((2, 2), np.float32), "a")
-    b = numpy_helper.from_array(np.ones((2, 2), np.float32) * 2, "b")
-    add_const = helper.make_node("Add", ["a", "b"], ["c"])
-    add_input = helper.make_node("Add", ["c", "x"], ["y"])
-    graph = helper.make_graph(
-        [add_const, add_input],
-        "foldable",
-        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 2])],
-        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 2])],
-        [a, b],
-    )
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 18)], ir_version=10
+    model = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 18]>
+        foldable (float[2,2] x) => (float[2,2] y)
+        <float[2,2] a = {1.0, 1.0, 1.0, 1.0}, float[2,2] b = {2.0, 2.0, 2.0, 2.0}>
+        {
+          c = Add(a, b)
+          y = Add(c, x)
+        }
+        """
     )
     onnx.checker.check_model(model)
     return model
@@ -147,6 +144,139 @@ def test_unavailable_provider_raises():
         )
 
 
+def test_unavailable_rocm_provider_error_names_rocm_wheel():
+    # The unavailable-provider error points at the right wheel per provider:
+    # CUDA users get onnxruntime-gpu, ROCm users onnxruntime-rocm, MIGraphX
+    # users onnxruntime-migraphx -- not a CUDA-only hint on an AMD machine.
+    if not backend.has_onnxruntime():
+        pytest.skip("requires onnxruntime")
+    import onnxruntime as rt
+
+    if "ROCMExecutionProvider" in rt.get_available_providers():
+        pytest.skip("ROCM provider is available; cannot test the unavailable path")
+    model = _make_foldable_model()
+    with pytest.raises(ValueError, match="onnxruntime-rocm"):
+        backend.run_model(
+            model,
+            {"x": np.zeros((2, 2), np.float32)},
+            providers=["ROCMExecutionProvider"],
+        )
+
+
+def test_unavailable_migraphx_provider_error_names_migraphx_wheel():
+    if not backend.has_onnxruntime():
+        pytest.skip("requires onnxruntime")
+    import onnxruntime as rt
+
+    if "MIGraphXExecutionProvider" in rt.get_available_providers():
+        pytest.skip("MIGraphX provider is available; cannot test the unavailable path")
+    model = _make_foldable_model()
+    with pytest.raises(ValueError, match="onnxruntime-migraphx"):
+        backend.run_model(
+            model,
+            {"x": np.zeros((2, 2), np.float32)},
+            providers=["MIGraphXExecutionProvider"],
+        )
+
+
+def _make_diamond_model() -> onnx.ModelProto:
+    """``a`` feeds two consumers (``b`` and ``c``) before they merge into
+    ``y`` -- exercises that ``_last_use_indices`` tracks the *last* consumer
+    of a multi-consumer value, not just its first.
+    """
+    model = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 18]>
+        diamond (float[4] x) => (float[4] y)
+        {
+          a = Relu(x)
+          b = Neg(a)
+          c = Sigmoid(a)
+          y = Add(b, c)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    return model
+
+
+def _make_if_model() -> onnx.ModelProto:
+    """A model with an ``If`` node -- forces the pruned reference path's
+    ``_has_subgraphs`` guard to bail out to the plain, always-correct
+    ``ReferenceEvaluator.run``.
+    """
+    model = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 18]>
+        agraph (bool cond, float[2] x) => (float[2] y)
+        {
+          y = If (cond) <
+            then_branch = g1 () => (float[2] then_out) { then_out = Identity(x) },
+            else_branch = g2 () => (float[2] else_out) { else_out = Neg(x) }
+          >
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    return model
+
+
+def test_reference_pruning_diamond_graph_correct(monkeypatch):
+    monkeypatch.setattr(backend, "_HAS_ONNXRUNTIME", False)
+    model = _make_diamond_model()
+    x = np.array([1.0, -2.0, 0.5, -0.5], dtype=np.float32)
+    outputs = backend.run_model(model, {"x": x})
+
+    a = np.maximum(x, 0)
+    expected = -a + 1 / (1 + np.exp(-a))
+    np.testing.assert_allclose(outputs["y"], expected, rtol=1e-6)
+
+
+def test_reference_pruning_matches_unpruned(monkeypatch):
+    # Same diamond model, run once through the pruning path and once through
+    # plain ReferenceEvaluator.run directly -- the results must be identical,
+    # not just individually plausible.
+    from onnx.reference import ReferenceEvaluator
+
+    model = _make_diamond_model()
+    x = np.array([3.0, -1.0, 2.0, -4.0], dtype=np.float32)
+
+    monkeypatch.setattr(backend, "_HAS_ONNXRUNTIME", False)
+    pruned = backend.run_model(model, {"x": x})
+
+    sess = ReferenceEvaluator(model)
+    unpruned = sess.run(list(sess.output_names), {"x": x})
+    np.testing.assert_array_equal(pruned["y"], unpruned[0])
+
+
+def test_reference_pruning_if_node_falls_back_and_is_correct(monkeypatch):
+    monkeypatch.setattr(backend, "_HAS_ONNXRUNTIME", False)
+    model = _make_if_model()
+
+    x = np.array([1.0, 2.0], dtype=np.float32)
+    then_out = backend.run_model(model, {"cond": np.array(True), "x": x})
+    np.testing.assert_allclose(then_out["y"], x)
+
+    else_out = backend.run_model(model, {"cond": np.array(False), "x": x})
+    np.testing.assert_allclose(else_out["y"], -x)
+
+
+def test_has_subgraphs():
+    assert backend._has_subgraphs(_make_diamond_model().graph) is False
+    assert backend._has_subgraphs(_make_if_model().graph) is True
+
+
+def test_last_use_indices_tracks_last_not_first_consumer():
+    graph = _make_diamond_model().graph
+    last_use = backend._last_use_indices(graph)
+    # nodes, in order: a=Relu(x) [0], b=Neg(a) [1], c=Sigmoid(a) [2], y=Add(b,c) [3]
+    assert last_use["x"] == 0
+    assert last_use["a"] == 2  # last consumer is c's node, not b's
+    assert last_use["b"] == 3
+    assert last_use["c"] == 3
+    assert "y" not in last_use  # a graph output, never consumed by another node
+
+
 def test_reference_evaluator_rejects_non_cpu_provider(monkeypatch):
     # Without onnxruntime the pure-Python reference evaluator cannot honour a
     # non-CPU provider, so asking for one is an error rather than a silent no-op.
@@ -162,3 +292,69 @@ def test_reference_evaluator_rejects_non_cpu_provider(monkeypatch):
     x = np.arange(4, dtype=np.float32).reshape(2, 2)
     outputs = backend.run_model(model, {"x": x}, providers=["CPUExecutionProvider"])
     np.testing.assert_allclose(outputs["y"], x + 3.0)
+
+
+@pytest.mark.skipif(
+    not backend.has_onnxruntime(), reason="requires onnxruntime for provider selection"
+)
+def test_unavailable_npu_provider_hint_mentions_ryzen_ai():
+    # The AMD NPU provider ships in AMD's Ryzen AI Software bundle, never in
+    # the stock PyPI wheel -- so when it is missing (the normal state on a
+    # machine without that bundle), the error must point at the Ryzen AI
+    # installer rather than at `onnxruntime-gpu`.
+    import onnxruntime as rt
+
+    if "VitisAIExecutionProvider" in rt.get_available_providers():
+        pytest.skip("Vitis AI provider is available; cannot test the missing path")
+    model = _make_foldable_model()
+    with pytest.raises(ValueError, match="Ryzen AI"):
+        backend.run_model(
+            model,
+            {"x": np.zeros((2, 2), np.float32)},
+            providers=["VitisAIExecutionProvider", "CPUExecutionProvider"],
+        )
+
+
+def test_npu_provider_binds_on_cpu():
+    # The Vitis AI EP partitions the graph into NPU/CPU subgraphs
+    # transparently; session tensors stay on the host, so loop binding must
+    # place them on the CPU (the safe fallback for any unknown provider too).
+    assert backend._binding_device(
+        ["VitisAIExecutionProvider", "CPUExecutionProvider"]
+    ) == ("cpu", 0)
+    assert backend._binding_device(
+        [("VitisAIExecutionProvider", {"config_file": "vaip_config.json"})]
+    ) == ("cpu", 0)
+
+
+@pytest.mark.skipif(
+    not backend.has_onnxruntime(), reason="requires onnxruntime for provider selection"
+)
+@pytest.mark.parametrize(
+    "provider", ["AxEngineExecutionProvider", "AXCLRTExecutionProvider"]
+)
+def test_unavailable_axera_provider_hint_mentions_pyaxengine(provider):
+    # Both Axera NPU providers ship in AXERA-TECH/pyaxengine's `axengine`
+    # wheel, never in a stock onnxruntime wheel -- so when one is missing
+    # (the normal state off the board), the error must point at pyaxengine
+    # rather than at `onnxruntime-gpu`.
+    import onnxruntime as rt
+
+    if provider in rt.get_available_providers():
+        pytest.skip(f"{provider} is available; cannot test the missing path")
+    model = _make_foldable_model()
+    with pytest.raises(ValueError, match="pyaxengine"):
+        backend.run_model(
+            model,
+            {"x": np.zeros((2, 2), np.float32)},
+            providers=[provider, "CPUExecutionProvider"],
+        )
+
+
+@pytest.mark.parametrize(
+    "provider", ["AxEngineExecutionProvider", "AXCLRTExecutionProvider"]
+)
+def test_axera_provider_binds_on_cpu(provider):
+    # Whichever subgraphs land on the Axera NPU, the session's own
+    # inputs/outputs stay host tensors, so loop binding goes on the CPU.
+    assert backend._binding_device([provider, "CPUExecutionProvider"]) == ("cpu", 0)

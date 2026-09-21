@@ -7,12 +7,15 @@
 #include <cstring>
 #include <set>
 #include <stdexcept>
+#include <utility>
 
+#include "bev_custom_op_schemas.h"
 #include "constant_folding.h"
 #include "contrib_schemas.h"
 #include "onnx/checker.h"
 #include "onnx/defs/schema.h"
 #include "onnx/version_converter/convert.h"
+#include "qonnx_schemas.h"
 
 void MixBytes(const char* data, size_t n, uint64_t& h1, uint64_t& h2) {
   const size_t n_words = n / sizeof(uint64_t);
@@ -497,7 +500,14 @@ void RemoveUnusedOutputs(onnx::ModelProto& model,
 // custom/other-domain opset imports are left untouched. Returns the model
 // unchanged when it is already at the requested version or does not import the
 // default domain.
-onnx::ModelProto ConvertOpsetVersion(const onnx::ModelProto& model,
+//
+// Takes ``model`` by value, and passes it as a mutable lvalue to
+// ConvertVersion below, so the call chain resolves to ConvertVersion's
+// consuming overload -- which moves initializer bytes through the Graph IR
+// round trip instead of copying them -- rather than the copying, const-ref
+// overload. Callers should ``std::move`` in a model they no longer need, so
+// this by-value parameter is itself move-constructed rather than copied.
+onnx::ModelProto ConvertOpsetVersion(onnx::ModelProto model,
                                      int target_version) {
   const auto current = DefaultOpsetVersion(model);
   if (!current || *current == target_version) {
@@ -515,6 +525,8 @@ onnx::ModelProto ConvertOpsetVersion(const onnx::ModelProto& model,
 // model that may not yet be fully valid.
 void PrepareSchemasForDebug(const onnx::ModelProto& model) {
   onnxsim::RegisterContribOpSchemas();
+  onnxsim::RegisterBevCustomOpSchemas();
+  onnxsim::RegisterQonnxCustomOpSchemas();
   FixupSchemaDeterminism();
   RegisterCustomDefaultDomainOpSchemas(model);
 }

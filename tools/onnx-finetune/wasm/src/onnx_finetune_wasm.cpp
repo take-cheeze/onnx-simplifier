@@ -7,6 +7,13 @@
 // which only has a path-based signature upstream; that one write goes through
 // Emscripten's in-memory MEMFS and gets read straight back out, never touching
 // a real disk.
+//
+// Knowledge distillation is a separate tool entirely -- see
+// ../distill_step_graph/step_graph_runner.mjs, which runs a self-contained
+// step graph from ../../scripts/generate_distillation_step_graph.py
+// (onnxsim's own graph_grad autodiff) via the official onnxruntime-web
+// package's plain, non-training ort.InferenceSession. This binding never
+// needs a second "teacher" model.
 
 #include <emscripten/bind.h>
 #include <emscripten/val.h>
@@ -53,7 +60,9 @@ class FinetuneSession {
 
   // input/target are JS Float32Array, flattened row-major
   // [batch, inputDim]/[batch, targetDim], matching the raw binary layout the
-  // native CLI reads from disk. Returns the loss for this step.
+  // native CLI reads from disk with its --label-dtype default (float32) --
+  // there is no --label-dtype int64 support in this binding. Returns the
+  // loss for this step.
   float trainStep(const val& input, const val& target, int batch, int input_dim, int target_dim) {
     std::vector<float> input_vec = emscripten::vecFromJSArray<float>(input);
     std::vector<float> target_vec = emscripten::vecFromJSArray<float>(target);

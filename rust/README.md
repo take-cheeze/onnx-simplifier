@@ -55,16 +55,22 @@ fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
     let opts = onnxsim::Options::new()
         .shape_inference(false)                       // skip if it crashes on your model
         .skip_optimizer("eliminate_nop_transpose")    // keep a specific pass off
+        .extra_optimizer("defuse_matmul_integer_to_float") // opt into a non-default pass
         .tensor_size_threshold(512 * 1024 * 1024);
     let simplified = onnxsim::simplify_with(&model, &opts)?;
     Ok(())
 }
 ```
 
-List the optimizer passes you can skip:
+List the optimizer passes you can skip, and the ones you can opt into with
+[`Options::extra_optimizer`] (off by default -- typically a graph-shape rewrite
+rather than a pure node reduction or fusion):
 
 ```rust
 for name in onnxsim::list_optimizers() {
+    println!("{name}");
+}
+for name in onnxsim::list_other_optimizers() {
     println!("{name}");
 }
 ```
@@ -156,7 +162,7 @@ three modes:
 
    Set `ONNXSIM_SKIP_ORT_DOWNLOAD=1` to forbid the automatic download (the build
    then requires the ONNX Runtime source to already be present at
-   `third_party/onnxruntime-1.28.0`).
+   `third_party/onnxruntime-1.29.0`).
 
    **Fast path — prebuilt ONNX Runtime.** To skip compiling ONNX Runtime from
    source, set `ONNXSIM_PREBUILT_ORT=1`. The build then links an official
@@ -167,8 +173,8 @@ three modes:
    ```sh
    ONNXSIM_PREBUILT_ORT=1 cargo build
    # optionally pin a version or reuse an already-extracted release:
-   ONNXSIM_PREBUILT_ORT=1 ONNXSIM_ORT_VERSION=1.28.0 cargo build
-   ONNXSIM_PREBUILT_ORT=1 ONNXSIM_ORT_HOME=/path/to/onnxruntime-linux-x64-1.28.0 cargo build
+   ONNXSIM_PREBUILT_ORT=1 ONNXSIM_ORT_VERSION=1.29.0 cargo build
+   ONNXSIM_PREBUILT_ORT=1 ONNXSIM_ORT_HOME=/path/to/onnxruntime-linux-x64-1.29.0 cargo build
    ```
 
 2. **Pre-built library.** If you already have `onnxsim_c` (and its dependencies)
@@ -211,7 +217,7 @@ covers exactly that situation.
 | `ONNXSIM_SOURCE_DIR`      | Override the onnxsim C++ source path (default `../..`).  |
 | `ONNXSIM_SKIP_ORT_DOWNLOAD` | Forbid the automatic ONNX Runtime source download.    |
 | `ONNXSIM_PREBUILT_ORT`    | Link a prebuilt ONNX Runtime release instead of building it. |
-| `ONNXSIM_ORT_VERSION`     | Prebuilt release version to fetch (default `1.28.0`).    |
+| `ONNXSIM_ORT_VERSION`     | Prebuilt release version to fetch (default `1.29.0`).    |
 | `ONNXSIM_ORT_HOME`        | Use an already-extracted prebuilt release (no download). |
 | `ONNXSIM_ORT_URL`         | Override the prebuilt release download URL.              |
 

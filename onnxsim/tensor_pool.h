@@ -207,14 +207,18 @@ class TensorPool {
   // translation unit from the safetensors codec above, since the two file
   // formats share nothing but the TensorPool storage they read into/from.
   // See gguf_dtype.h's file comment for an important scope note: most of
-  // GGML's block-quantized types (Q4_0, every IQ*_ variant, ...) have no
-  // ONNX raw-data equivalent and are never pooled -- LoadGGUF skips and
+  // GGML's block-quantized types (every IQ*_ variant, Q8_1, Q8_K, ...) have
+  // no ONNX raw-data equivalent and are never pooled -- LoadGGUF skips and
   // reports them rather than writing garbage. The K-quant family
-  // (Q4_K/Q5_K/Q6_K/Q8_0) -- what a real quantized checkpoint (e.g.
-  // Unsloth's GGUF exports) actually uses for the bulk of its weights -- IS
-  // pooled, holding its native, still-packed block bytes (see
-  // gguf_dtype.h's IsKQuant); DequantizeToFloat below decodes an entry like
-  // that to plain float32 values.
+  // (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0) -- what a real quantized checkpoint (e.g.
+  // Unsloth's GGUF exports) actually uses for the bulk of its weights --
+  // the legacy family (Q4_0/Q4_1/Q5_0/Q5_1, which llama.cpp's own mixed-
+  // precision quantizers still pick for particular tensor roles even in an
+  // otherwise K-quant checkpoint) -- and MXFP4 (gpt-oss-20b's own native
+  // MoE-expert quantization) ARE pooled, holding their native, still-packed
+  // block bytes (see gguf_dtype.h's IsKQuant/IsLegacyQuant/IsMxfp4);
+  // DequantizeToFloat below decodes an entry like that to plain float32
+  // values.
 
   // Write every entry to a GGUF file at `path`. Every dtype TensorPool can
   // hold has a raw ggml_type counterpart (see gguf_dtype.h), so -- unlike
@@ -240,21 +244,22 @@ class TensorPool {
 
   // Replace this pool's contents with every tensor in the GGUF file at
   // `path` whose ggml_type this pool can represent -- either a *raw*,
-  // unquantized type (stored as-is) or one of the four K-quant types
-  // gguf_dtype.h's IsKQuant covers (stored as its native, still-packed
-  // block bytes -- see DequantizeToFloat to decode one). Every other
-  // quantized type (Q4_0, every IQ*_ variant, ...) has no representation
-  // this pool can hold at all. Unlike LoadSafetensors, this does NOT read
-  // the whole file into memory: only the (small) header/metadata/tensor-
-  // info section is read up front, and each *included* tensor's bytes are
-  // read with their own targeted seek + read -- loading a large quantized
-  // checkpoint this way costs only the bytes of the tensors this pool can
-  // actually use, not the whole file. Returns the names of tensors that
-  // were present in the file but skipped because their ggml_type has no
-  // representation this pool can hold (empty if every tensor was loaded).
-  // Throws std::runtime_error on I/O failure, an unrecognized magic/
-  // version, a malformed header, or a K-quant tensor whose element count
-  // is not a multiple of its quantization block size.
+  // unquantized type (stored as-is) or one of the block-quantized types
+  // gguf_dtype.h's IsKQuant/IsLegacyQuant/IsMxfp4 cover (stored as its
+  // native, still-packed block bytes -- see DequantizeToFloat to decode
+  // one). Every other quantized type (every IQ*_ variant, Q8_1, Q8_K, ...)
+  // has no representation this pool can hold at all. Unlike LoadSafetensors,
+  // this does NOT read the whole file into memory: only the (small) header/
+  // metadata/tensor-info section is read up front, and each *included*
+  // tensor's bytes are read with their own targeted seek + read -- loading a
+  // large quantized checkpoint this way costs only the bytes of the tensors
+  // this pool can actually use, not the whole file. Returns the names of
+  // tensors that were present in the file but skipped because their
+  // ggml_type has no representation this pool can hold (empty if every
+  // tensor was loaded). Throws std::runtime_error on I/O failure, an
+  // unrecognized magic/version, a malformed header, or a block-quantized
+  // tensor whose element count is not a multiple of its quantization block
+  // size.
   std::vector<std::string> LoadGGUF(const std::string& path);
 
   // Like LoadGGUF, but memory-maps `path` (mmap() on POSIX, MapViewOfFile()
@@ -285,14 +290,14 @@ class TensorPool {
 
   // Decodes `name`'s entry to plain float32 values, appended to `out` (not
   // cleared first) -- the only way to get usable numeric values out of an
-  // entry LoadGGUF/LoadGGUFMmap pooled from a K-quant (Q4_K/Q5_K/Q6_K/Q8_0)
-  // source, since its `data` otherwise holds native, still-packed GGML
-  // block bytes, not per-element values (see gguf_dtype.h's IsKQuant).
-  // Returns false, leaving `out` untouched, if `name` isn't in the pool or
-  // its dtype is not one of those four K-quant codes (including an
-  // ordinary raw dtype, e.g. FLOAT/FLOAT16 -- those need no decoding at
-  // all; read Entry::data directly, the same way every other TensorPool
-  // consumer already does).
+  // entry LoadGGUF/LoadGGUFMmap pooled from a K-quant (Q4_K/Q5_K/Q6_K/Q8_0),
+  // legacy (Q4_0/Q4_1/Q5_0/Q5_1), or MXFP4 source, since its `data`
+  // otherwise holds native, still-packed GGML block bytes, not per-element
+  // values (see gguf_dtype.h's IsKQuant/IsLegacyQuant/IsMxfp4). Returns
+  // false, leaving `out` untouched, if `name` isn't in the pool or its
+  // dtype is not one of those nine codes (including an ordinary raw dtype,
+  // e.g. FLOAT/FLOAT16 -- those need no decoding at all; read Entry::data
+  // directly, the same way every other TensorPool consumer already does).
   bool DequantizeToFloat(const std::string& name,
                          std::vector<float>* out) const;
 
@@ -307,6 +312,57 @@ class TensorPool {
 // only the 8-byte length prefix, not the whole file. Throws
 // std::runtime_error on I/O failure.
 uint64_t HeaderPrefixSize(const std::string& path);
+
+// One decoded GGUF metadata value (see
+// https://github.com/ggml-org/ggml/blob/master/docs/gguf.md's KV section).
+// Every integer width (u8..u64, i8..i64) collapses to int64_t and every
+// float width (f32/f64) to double -- GGUF architecture hyperparameters
+// (layer counts, head counts, RoPE base, norm epsilon, ...) always fit
+// comfortably in either, and this saves ReadGGUFMetadata's callers from
+// switching on eight numeric widths. `kind` says which field is meaningful.
+struct GGUFMetadataValue {
+  enum class Kind { kInt, kFloat, kString, kBool };
+  Kind kind = Kind::kInt;
+  int64_t int_value = 0;
+  double float_value = 0.0;
+  std::string string_value;
+  bool bool_value = false;
+};
+
+// One tensor's header-section entry: name, ONNX-order shape (outermost
+// dimension first -- already reversed from GGUF's own ne[], the same
+// reversal LoadGGUF/LoadGGUFMmap apply to the tensors they actually pool),
+// and raw ggml_type code (see gguf_dtype.h's IsKQuant/IsRaw/ToOnnx to
+// interpret it). No tensor byte data is read -- see ReadGGUFMetadata below.
+struct GGUFTensorInfo {
+  std::string name;
+  std::vector<int64_t> shape;
+  uint32_t ggml_type = 0;
+};
+
+struct GGUFMetadata {
+  // ARRAY-typed metadata values (e.g. tokenizer.ggml.tokens, which alone can
+  // hold >100k strings in a real checkpoint) are intentionally omitted from
+  // `kv` rather than decoded -- this is meant to be a cheap read of a
+  // checkpoint's scalar architecture hyperparameters
+  // (general.architecture, <arch>.block_count,
+  // <arch>.attention.head_count, <arch>.rope.freq_base, ...), not a general
+  // GGUF metadata dump.
+  std::map<std::string, GGUFMetadataValue> kv;
+  std::vector<GGUFTensorInfo> tensors;
+};
+
+// Parses a GGUF file's header + metadata-KV + tensor-info sections at
+// `path` and returns them decoded -- unlike TensorPool::LoadGGUF/
+// LoadGGUFMmap, this never reads the (potentially huge, and for K-quant
+// tensors, differently-packed) tensor *data* section, so it stays cheap
+// even against a multi-gigabyte real checkpoint. This is how a caller
+// recovers the architecture hyperparameters TensorPool::LoadGGUF itself
+// discards while parsing the very same header section (it only ever looks
+// at general.alignment). Throws std::runtime_error on I/O failure, an
+// unrecognized magic/version, or a malformed header -- same conditions as
+// LoadGGUF.
+GGUFMetadata ReadGGUFMetadata(const std::string& path);
 
 }  // namespace tensor_pool
 }  // namespace onnxsim

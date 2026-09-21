@@ -10,8 +10,10 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
+#include "constant_folding.h"
 #include "onnx/common/graph_shape_inference.h"
 #include "onnx/common/ir_pb_converter.h"
 #include "onnx/defs/schema.h"
@@ -190,6 +192,54 @@ onnxsim::SymNode ToSymNode(const onnx::NodeProto& node) {
   return n;
 }
 
+// A `Constant` node's own embedded value, read directly from its `value` /
+// `value_ints` / `value_int` attribute -- mirrors sym_value_eval.cpp's own
+// EvalConstant. Needed because a genuine (non-transient) Constant node is
+// never folded into a graph initializer any more (constant_folding.cpp
+// deliberately leaves it as a producer node -- see kTransientConstantAttr's
+// own comment), yet M2's shape rules (Squeeze axes, Reshape/Expand shape,
+// Slice starts/ends/axes/steps, Split sizes, ...) only ever consult
+// ShapeGraph::initializer for a data-input's concrete values. Without this, an
+// int-list operand sourced from an unfolded Constant node is invisible to M2:
+// the rule either fails outright, or -- worse, for Squeeze/Unsqueeze's
+// "no axes" fallback -- silently substitutes the wrong heuristic (dropping
+// every dim that happens to be 1, including ones the real, unseen axes list
+// would not have touched). M1 (EvaluateSymbolicValues) does not need this: it
+// evaluates every node in topological order, `Constant` included.
+std::optional<onnxsim::SymTensor> ConstantNodeValue(
+    const onnxsim::SymNode& node) {
+  if (node.op_type != "Constant") return std::nullopt;
+  if (const onnxsim::SymAttr* a = node.attr("value")) {
+    if (a->t) return *a->t;
+  }
+  if (const onnxsim::SymAttr* a = node.attr("value_ints")) {
+    std::vector<onnxsim::SymExpr> v;
+    v.reserve(a->ints.size());
+    for (int64_t x : a->ints) v.emplace_back(x);
+    return onnxsim::SymTensor::Vector(std::move(v));
+  }
+  if (const onnxsim::SymAttr* a = node.attr("value_int")) {
+    if (a->i) return onnxsim::SymTensor::Scalar(onnxsim::SymExpr(*a->i));
+  }
+  return std::nullopt;
+}
+
+// Adds every `Constant` node's own value into `initializers`, so M2's
+// ShapeGraph::initializer-only lookups (see ConstantNodeValue's own comment)
+// see it exactly as if it were a real graph initializer. `nodes` is the
+// already-built SymNode list, so this needs no re-parsing of attributes.
+void AddConstantNodeValues(
+    const std::vector<onnxsim::SymNode>& nodes,
+    std::map<std::string, onnxsim::SymTensor>& initializers) {
+  for (const auto& node : nodes) {
+    if (node.output.size() != 1 || node.output[0].empty()) continue;
+    if (initializers.count(node.output[0])) continue;
+    if (auto t = ConstantNodeValue(node)) {
+      initializers[node.output[0]] = std::move(*t);
+    }
+  }
+}
+
 // Run M2 (symbolic activation-shape inference) then M1 (symbolic value
 // evaluation) over `model`, returning every shape-data tensor the evaluator
 // could resolve as a SymTensor (its entries possibly still symbolic).
@@ -209,6 +259,7 @@ std::map<std::string, onnxsim::SymTensor> EvaluateModelSymbolicValues(
     for (int64_t d : init.dims()) s.emplace_back(d);
     shapes_seed[init.name()] = std::move(s);
   }
+  AddConstantNodeValues(nodes, initializers);
   auto seed = [&](const onnx::ValueInfoProto& vi) {
     if (shapes_seed.count(vi.name()))
       return;  // keep the concrete initializer shape
@@ -354,6 +405,7 @@ std::map<std::string, onnxsim::SymTensor> EvaluateGraphSymbolicValues(
     for (int64_t d : inits[i]->sizes()) s.emplace_back(d);
     shapes_seed[init_names[i]] = std::move(s);
   }
+  AddConstantNodeValues(nodes, initializers);
   auto seed = [&](onnx::Value* v) {
     if (shapes_seed.count(v->uniqueName()))
       return;  // keep the concrete initializer shape
@@ -376,6 +428,49 @@ std::map<std::string, onnxsim::SymTensor> EvaluateGraphSymbolicValues(
   vg.initializer = std::move(initializers);
   vg.shape = onnxsim::InferSymbolicShapes(sg);
   return onnxsim::EvaluateSymbolicValues(vg);
+}
+
+// ModelProto-flavoured CollectRankUnsafeDataValues (declared further down,
+// next to the Graph-native folder) -- see that function's comment for what
+// "rank unsafe" means and why the mark has to be carried forward. Rank comes
+// from the model's type map rather than a Value's own sizes(), and a name
+// missing from that map counts as "rank not proven", i.e. unsafe.
+std::unordered_set<std::string> CollectRankUnsafeDataValuesOnModel(
+    const onnx::GraphProto& graph,
+    const std::unordered_map<std::string, const onnx::TypeProto*>& type_map,
+    const onnx::shape_inference::DataValueMap& data_map) {
+  std::unordered_set<std::string> unsafe;
+  auto rank_is_modelled = [&type_map](const std::string& name) {
+    auto iter = type_map.find(name);
+    if (iter == type_map.end() || !iter->second->has_tensor_type()) {
+      return false;
+    }
+    const auto& tensor_type = iter->second->tensor_type();
+    return tensor_type.has_shape() && tensor_type.shape().dim_size() <= 1;
+  };
+  // A GraphProto's nodes are required to be in topological order, so one pass
+  // over them propagates the mark completely.
+  for (const auto& node : graph.node()) {
+    bool tainted = false;
+    for (const std::string& in : node.input()) {
+      if (data_map.count(in) == 0) {
+        continue;
+      }
+      if (unsafe.count(in) != 0 || !rank_is_modelled(in)) {
+        tainted = true;
+        break;
+      }
+    }
+    for (const std::string& out : node.output()) {
+      if (data_map.count(out) == 0) {
+        continue;
+      }
+      if (tainted || !rank_is_modelled(out)) {
+        unsafe.insert(out);
+      }
+    }
+  }
+  return unsafe;
 }
 
 // Partial shape evaluation (issue #139) via ONNX data propagation.
@@ -510,6 +605,11 @@ void _EvalPartialShape(onnx::ModelProto& model) {
 
   const auto type_map = BuildTypeMap(model);
 
+  // Values whose propagated data must not be trusted -- see
+  // CollectRankUnsafeDataValues' own comment.
+  const std::unordered_set<std::string> rank_unsafe =
+      CollectRankUnsafeDataValuesOnModel(model.graph(), type_map, data_map);
+
   // Maps the output of a foldable node to the constant tensor it produces. Each
   // such node is rewritten into a `Constant` node holding this value.
   std::unordered_map<std::string, onnx::TensorProto> folded_values;
@@ -523,6 +623,9 @@ void _EvalPartialShape(onnx::ModelProto& model) {
     const std::string& output = node.output(0);
     auto data_iter = data_map.find(output);
     if (data_iter == data_map.end()) {
+      continue;
+    }
+    if (rank_unsafe.count(output) != 0) {
       continue;
     }
 
@@ -606,6 +709,9 @@ void _EvalPartialShape(onnx::ModelProto& model) {
     if (data_iter == data_map.end()) {
       continue;
     }
+    if (rank_unsafe.count(node.input(1)) != 0) {
+      continue;
+    }
     const onnx::TensorShapeProto& shape_value = data_iter->second;
     if (shape_value.dim_size() == 0) {
       continue;
@@ -676,6 +782,12 @@ void _EvalPartialShape(onnx::ModelProto& model) {
       int64_t element_count = 1;
       for (int64_t d : dims) element_count *= d;
       if (element_count != static_cast<int64_t>(flat.size())) continue;
+      // SymTensor models a rank-0 scalar or a rank-1 vector and nothing else
+      // (sym_value_eval.h), and its evaluators say so -- EvalSlice is "rank-1
+      // data, axis 0 only", Transpose is evaluated as the identity. Same
+      // reasoning as CollectRankUnsafeDataValues: a flat element sequence must
+      // not be reinterpreted under a rank >= 2 output's dims (issue #1284).
+      if (dims.size() > 1) continue;
       onnx::TensorProto tp;
       tp.set_data_type(elem_type);
       for (int64_t d : dims) tp.add_dims(d);
@@ -752,6 +864,16 @@ void _EvalPartialShape(onnx::ModelProto& model) {
       attr->set_name("value");
       attr->set_type(onnx::AttributeProto::TENSOR);
       *attr->mutable_t() = std::move(iter->second);
+      // Marked transient (see kTransientConstantAttr's own comment): this
+      // Constant node is this pass's own intermediate representation for a
+      // value it already proved fully known, not a source of "not from
+      // initializers" provenance -- the ordinary constant folder should
+      // normalize it away like any other node, not treat it as an opaque
+      // Constant to leave alone.
+      onnx::AttributeProto* transient_attr = constant->add_attribute();
+      transient_attr->set_name(kTransientConstantAttr);
+      transient_attr->set_type(onnx::AttributeProto::INT);
+      transient_attr->set_i(1);
       continue;
     }
     auto fix_iter = node.output_size() == 1 ? reshape_fixes.find(node.output(0))
@@ -768,6 +890,11 @@ void _EvalPartialShape(onnx::ModelProto& model) {
       attr->set_name("value");
       attr->set_type(onnx::AttributeProto::TENSOR);
       *attr->mutable_t() = std::move(fix_iter->second.shape_tensor);
+      // Transient -- see the other creation site's own comment above.
+      onnx::AttributeProto* transient_attr = shape_const->add_attribute();
+      transient_attr->set_name(kTransientConstantAttr);
+      transient_attr->set_type(onnx::AttributeProto::INT);
+      transient_attr->set_i(1);
 
       onnx::NodeProto* reshape = model.mutable_graph()->add_node();
       *reshape = std::move(node);
@@ -778,6 +905,68 @@ void _EvalPartialShape(onnx::ModelProto& model) {
   }
 }
 
+// Values whose ONNX-propagated data is meaningless because the propagation ran
+// on a tensor of a rank it does not model (onnxsim issue #1284).
+//
+// Data propagation carries a value as a `TensorShapeProto` -- a flat sequence
+// with no rank of its own -- because it exists to resolve *shape* scaffolding,
+// which is rank <= 1 by nature. Every `PartialDataPropagationFunction` is
+// written for that form: `Slice`'s says outright "Only supports axis = 0 since
+// the data comes from Shape", and `DataPropagationContextImpl::getInputData`
+// refuses to seed data from an initializer of rank >= 2 for the same reason.
+//
+// Nothing enforces that on a value produced *inside* the propagation, though.
+// Let a rank >= 2 tensor in -- e.g. the `[3, 2]` pads matrix in the
+// `Concat -> Reshape([-1, 2]) -> Slice(steps=-1) -> Transpose -> Reshape([-1])`
+// construction PyTorch emits for `F.pad` -- and the propagators silently read
+// its flat entries as a rank-1 element order: that `Slice` must reverse the 3
+// rows, but the propagator reverses all 6 flat entries. The value is still
+// "fully known", just wrong, and it keeps propagating to everything downstream,
+// so an element-count check on the folded node alone does not catch it.
+//
+// So mark a value's propagated data unusable when the value's own rank is not
+// provably <= 1, and carry that mark forward through any node that consumed a
+// marked value's data. `Shape(x)` and friends are unaffected: `x` carries no
+// propagated data of its own, so a rank-4 activation feeding a `Shape` marks
+// nothing -- which is the whole point of this pass (issue #139).
+std::unordered_set<std::string> CollectRankUnsafeDataValues(
+    const std::vector<onnx::Node*>& node_ptrs,
+    const onnx::shape_inference::DataValueMap& data_map) {
+  std::unordered_set<std::string> unsafe;
+  // A rank onnx's own data propagation models: a rank-0 scalar or a rank-1
+  // vector, and only when shape inference actually proved which.
+  auto rank_is_modelled = [](const onnx::Value* v) {
+    return v->has_sizes() && v->sizes().size() <= 1;
+  };
+  // node_ptrs is in topological order, so a producer is always visited before
+  // its consumers and one pass suffices.
+  for (const onnx::Node* node : node_ptrs) {
+    bool tainted = false;
+    for (const onnx::Value* in : node->inputs()) {
+      const std::string& name = in->uniqueName();
+      // Only an input that actually carries propagated data can taint this
+      // node's output; an ordinary activation input cannot.
+      if (data_map.count(name) == 0) {
+        continue;
+      }
+      if (unsafe.count(name) != 0 || !rank_is_modelled(in)) {
+        tainted = true;
+        break;
+      }
+    }
+    for (const onnx::Value* out : node->outputs()) {
+      const std::string& name = out->uniqueName();
+      if (data_map.count(name) == 0) {
+        continue;
+      }
+      if (tainted || !rank_is_modelled(out)) {
+        unsafe.insert(name);
+      }
+    }
+  }
+  return unsafe;
+}
+
 // Graph-native counterpart of _EvalPartialShape: same two rewrites (fold a
 // fully-known shape-family output to a Constant; materialize a Reshape's
 // shape input as a Constant with a single -1 slot when everything else is
@@ -786,7 +975,9 @@ void _EvalPartialShape(onnx::ModelProto& model) {
 // onnx/common/graph_shape_inference.h) instead of onnx's protobuf-based
 // InferShapes. Returns whether anything changed, so the fully Graph-native
 // outer pipeline can use it as a GraphFnChanged step.
-bool _EvalPartialShapeOnGraph(onnx::Graph& g) {
+bool _EvalPartialShapeOnGraph(
+    onnx::Graph& g, const onnx::shape_inference::ModelLocalFunctionsMap&
+                        model_local_functions) {
   // Mirrors _EvalPartialShape's own snapshot/restore of value_info/output:
   // this pass's own data-propagation inference call must not leave its
   // (lenient, check_type=false) shape/type conclusions on the graph --
@@ -825,12 +1016,17 @@ bool _EvalPartialShapeOnGraph(onnx::Graph& g) {
                                               /*error_mode=*/0,
                                               /*enable_data_propagation=*/true);
     try {
-      onnx::InferShapesOnGraph(g, options, &data_map);
+      onnx::InferShapesOnGraph(g, options, &data_map, model_local_functions);
     } catch (const std::exception&) {
       restore();
       return false;
     }
   }
+
+  // Values whose propagated data must not be trusted -- see
+  // CollectRankUnsafeDataValues' own comment.
+  const std::unordered_set<std::string> rank_unsafe =
+      CollectRankUnsafeDataValues(node_ptrs, data_map);
 
   // Maps the output of a foldable node to the constant tensor it produces.
   std::unordered_map<std::string, onnx::Tensor> folded_values;
@@ -839,6 +1035,7 @@ bool _EvalPartialShapeOnGraph(onnx::Graph& g) {
     onnx::Value* out = node->outputs()[0];
     auto data_iter = data_map.find(out->uniqueName());
     if (data_iter == data_map.end()) continue;
+    if (rank_unsafe.count(out->uniqueName())) continue;
 
     const onnx::TensorShapeProto& value = data_iter->second;
     bool fully_known = true;
@@ -898,6 +1095,7 @@ bool _EvalPartialShapeOnGraph(onnx::Graph& g) {
     if (folded_values.count(node->outputs()[0]->uniqueName())) continue;
     auto data_iter = data_map.find(node->inputs()[1]->uniqueName());
     if (data_iter == data_map.end()) continue;
+    if (rank_unsafe.count(node->inputs()[1]->uniqueName())) continue;
     const onnx::TensorShapeProto& shape_value = data_iter->second;
     if (shape_value.dim_size() == 0) continue;
     int unknown = 0;
@@ -966,6 +1164,12 @@ bool _EvalPartialShapeOnGraph(onnx::Graph& g) {
       int64_t element_count = 1;
       for (int64_t d : dims) element_count *= d;
       if (element_count != static_cast<int64_t>(flat.size())) continue;
+      // SymTensor models a rank-0 scalar or a rank-1 vector and nothing else
+      // (sym_value_eval.h), and its evaluators say so -- EvalSlice is "rank-1
+      // data, axis 0 only", Transpose is evaluated as the identity. Same
+      // reasoning as CollectRankUnsafeDataValues: a flat element sequence must
+      // not be reinterpreted under a rank >= 2 output's dims (issue #1284).
+      if (dims.size() > 1) continue;
       onnx::Tensor t;
       t.elem_type() = elem_type;
       t.sizes() = dims;
@@ -1029,6 +1233,12 @@ bool _EvalPartialShapeOnGraph(onnx::Graph& g) {
   // shape-producing subgraph dead for the optimizer's own dead-node
   // elimination to remove.
   static const onnx::Symbol kValueAttr("value");
+  // Marked transient (see kTransientConstantAttr's own comment): this pass's
+  // Constant nodes are its own intermediate representation for a value
+  // already proved fully known, not a source of "not from initializers"
+  // provenance -- the ordinary constant folder should normalize them away
+  // like any other node.
+  static const onnx::Symbol kTransientAttr(kTransientConstantAttr);
   for (onnx::Node* node : node_ptrs) {
     if (node->outputs().size() != 1) continue;
     onnx::Value* out = node->outputs()[0];
@@ -1036,6 +1246,7 @@ bool _EvalPartialShapeOnGraph(onnx::Graph& g) {
     if (iter != folded_values.end()) {
       onnx::Node* constant = g.create(onnx::kConstant, 1);
       constant->t_(kValueAttr, iter->second);
+      constant->i_(kTransientAttr, 1);
       constant->outputs()[0]->setElemType(iter->second.elem_type());
       constant->outputs()[0]->setSizes(std::vector<onnx::Dimension>(
           iter->second.sizes().begin(), iter->second.sizes().end()));
@@ -1048,6 +1259,7 @@ bool _EvalPartialShapeOnGraph(onnx::Graph& g) {
     if (fix_iter != reshape_fixes.end() && node->kind() == onnx::kReshape) {
       onnx::Node* shape_const = g.create(onnx::kConstant, 1);
       shape_const->t_(kValueAttr, fix_iter->second.shape_tensor);
+      shape_const->i_(kTransientAttr, 1);
       shape_const->outputs()[0]->setElemType(
           fix_iter->second.shape_tensor.elem_type());
       shape_const->outputs()[0]->setSizes(std::vector<onnx::Dimension>(

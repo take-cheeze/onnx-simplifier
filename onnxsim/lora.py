@@ -1,0 +1,839 @@
+"""LoRA (low-rank adapter) injection and training -- onnxsim's own answer to
+what ``tools/onnx-finetune`` needs a training-enabled ONNX Runtime build for.
+
+``tools/onnx-finetune`` injects a trainable ``X @ A @ B`` branch around a
+frozen weight and trains ``A``/``B`` via ``onnxruntime.training.artifacts``,
+which needs ONNX Runtime built from source with ``--enable_training`` --
+unavailable via ``pip install onnxruntime``. This module does the same graph
+surgery, but trains the adapter with :mod:`onnxsim.graph_grad`'s hand-rolled
+reverse-mode autodiff instead: the same machinery :mod:`onnxsim.qat` already
+uses for block-wise quantization-reconstruction, which differentiates a
+forward slice into an ordinary ONNX step graph and so runs on any inference
+runtime, not just a training-enabled one.
+
+**Why this needs (almost) no new gradient machinery.**
+:func:`onnxsim.graph_grad.build_backward` already treats anything not in its
+``targets`` list as frozen -- exactly "freeze the base weight ``W``, train
+only the small ``A``/``B`` matrices" LoRA needs. Injection (this module's own
+job) never modifies ``W``; training just asks ``build_backward`` for the
+gradients of ``A``/``B`` alone, and the base branch's own nodes are appended
+to the step graph verbatim, generating whatever gradient nodes reaching
+``A``/``B`` requires along the way, exactly like reaching a QAT block's
+trained weight does today.
+
+**What this is not.** Reference-model distillation (:func:`train_lora` with
+``reference_model=``) can only ever teach an adapter to reproduce that
+reference -- see :func:`onnxsim.qat.apply_block_finetune`'s own docstring for
+why that alone is not "fine-tuning on a new task." ``target_data=`` is the
+escape hatch: a caller-supplied label tensor drives the same MSE step graph
+directly, which is the actual point of LoRA fine-tuning in practice.
+
+**Injection is plain graph surgery, not a step graph.** It follows
+:func:`onnxsim.nf4.quantize_weight_only_nf4`'s own style -- edit an existing,
+already-deployed ``ModelProto`` once with :mod:`onnx.helper`/
+:mod:`onnx.numpy_helper`, not :class:`onnxsim.qat_graph.GraphBuilder` (which
+exists for one-shot step-graph construction, not editing a model that is
+already meant to be run as-is).
+
+See ``tools/onnx-finetune/scripts/lora_surgery.py`` for the tool this ports
+from. **QLoRA composition** (:func:`apply_qlora`) needs one extra step:
+:func:`onnxsim.nf4.quantize_weight_only_nf4`'s dequantization chain includes
+a ``Cast``, which has no rule in :data:`onnxsim.graph_grad.SUPPORTED_OPS` --
+even though nothing needs a gradient through it, since it feeds the frozen
+base weight, never the LoRA branch. :func:`_fold_frozen_prefixes` handles
+this generically: any node whose entire input closure is constants (not the
+adapter's own ``A``/``B``) is evaluated once and folded into a plain
+initializer before ``build_backward`` ever sees it, which is exactly what a
+step graph -- where the base weight never changes across steps anyway --
+should do with it regardless of which quantization scheme produced it.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple, Union
+
+import numpy as np
+import onnx
+import onnx.numpy_helper
+
+from onnxsim import backend, graph_grad, nf4, qat, qat_graph
+from onnxsim.calibration import Tensors, generate_random_calibration_data
+
+# Every name this module introduces into a step graph starts here, so it
+# cannot collide with a tensor name carried over from the model -- the same
+# convention onnxsim.qat's own "qat__" prefix follows, kept distinct so the
+# two never collide if a caller ever mixed both in one graph.
+_PREFIX = "lora__"
+
+_ELIGIBLE_OP_TYPES = ("MatMul", "Gemm", "Conv")
+
+
+@dataclass
+class LoraTarget:
+    """One injected adapter, tied to the base weight it augments."""
+
+    #: The frozen base initializer name. Never modified by injection or
+    #: training -- the whole point of the low-rank branch.
+    weight_name: str
+    #: The original node's output tensor name -- what the closing ``Add``
+    #: restores, so every existing downstream consumer needs no changes.
+    node_output: str
+    op_type: str  # "MatMul" | "Gemm" | "Conv"
+    #: New initializer name, ``f"{weight_name}.lora_A"``.
+    lora_a_name: str
+    #: New initializer name, ``f"{weight_name}.lora_B"``.
+    lora_b_name: str
+    rank: int
+    alpha: Optional[float]
+
+
+@dataclass
+class LoraAdapter:
+    """Every adapter one :func:`inject_lora` call injected."""
+
+    targets: List[LoraTarget] = field(default_factory=list)
+
+    def parameter_names(self) -> List[str]:
+        """Every ``lora_A``/``lora_B`` initializer name -- the ``targets``
+        list :func:`train_lora` hands to :func:`onnxsim.graph_grad.build_backward`,
+        and the ``skip_names`` :func:`apply_qlora` passes to
+        :func:`onnxsim.nf4.quantize_weight_only_nf4`."""
+        names: List[str] = []
+        for t in self.targets:
+            names.append(t.lora_a_name)
+            names.append(t.lora_b_name)
+        return names
+
+
+def inject_lora(
+    model: Union[str, onnx.ModelProto],
+    rank: int = 8,
+    alpha: Optional[float] = None,
+    target_op_types: Sequence[str] = _ELIGIBLE_OP_TYPES,
+    target_names: Optional[Sequence[str]] = None,
+    seed: int = 0,
+) -> Tuple[onnx.ModelProto, LoraAdapter]:
+    """Injects a trainable low-rank adapter branch around every eligible
+    ``MatMul``/``Gemm``/``Conv`` weight, leaving the base weight itself
+    untouched and every other byte of the model unchanged.
+
+    Eligible: ``MatMul``/``Gemm`` with a 2-D ``float32`` initializer at
+    ``input[1]``; ``Conv`` with a 4-D ``float32`` initializer,
+    ``kernel_shape == [1, 1]`` and ``group == 1`` (mirroring
+    ``tools/onnx-finetune``'s own ``lora_surgery.py`` conditions, not
+    :func:`onnxsim.qat._find_float_layers`'s looser ones -- that function
+    admits any-shape ``Conv``, which a low-rank branch cannot represent).
+
+    :param model: the model to inject into, or a file path.
+    :param rank: the adapter's inner dimension.
+    :param alpha: when given, the branch is scaled by ``alpha / rank``
+            before being added to the base branch's output (LoRA's usual
+            convention); when ``None``, the branch is added unscaled.
+    :param target_op_types: restrict injection to these op types.
+    :param target_names: restrict injection to weights with these initializer
+            names; ``None`` means every eligible node.
+    :param seed: seeds ``A``'s Kaiming-normal initialization. ``B`` always
+            starts at zero, so injection is a numeric no-op until trained --
+            checked directly by ``tests/test_lora.py``.
+    :returns: ``(model with adapters injected, the injected LoraAdapter)``.
+
+    This is now a thin alias for the verified C++ port
+    :func:`onnxsim.inject_lora_cpp` (``onnxsim/lora_entry.cpp``'s own
+    ``InjectLora``), forwarding every argument unchanged -- the pure-Python
+    graph surgery this docstring used to describe (``_inject_matmul``/
+    ``_inject_gemm``/``_inject_conv1x1`` and their shared
+    ``_scale_initializer``/``_attr_int(s)``/``_insert_after`` helpers) was
+    removed once :func:`onnxsim.inject_lora_cpp` was checked to produce the
+    exact same ``LoraTarget``/``LoraAdapter`` field values for every field
+    except ``A``'s own initializer contents (which only need to be finite
+    and correctly-shaped -- see ``lora_entry.h``'s own documented
+    accepted RNG-stream divergence from numpy's PCG64, immaterial here
+    since ``B`` always starts at zero) -- see ``tests/test_lora_inject_cpp.py``.
+    Imported lazily (inside the function body, not at module scope) to
+    avoid a circular import: ``onnxsim.onnx_simplifier`` already imports
+    from this module, so importing it back at module load time here would
+    deadlock the import machinery (the same reason :func:`onnxsim.gptq.apply_gptq`
+    imports :func:`onnxsim.apply_gptq_cpp` lazily).
+    """
+    from onnxsim.onnx_simplifier import inject_lora_cpp
+
+    return inject_lora_cpp(
+        model,
+        rank=rank,
+        alpha=alpha,
+        target_op_types=target_op_types,
+        target_names=target_names,
+        seed=seed,
+    )
+
+
+def _fold_frozen_prefixes(
+    nodes: Sequence[onnx.NodeProto],
+    model: onnx.ModelProto,
+    non_foldable_names: Sequence[str],
+) -> Tuple[List[onnx.NodeProto], List[onnx.TensorProto]]:
+    """Constant-folds every node in ``nodes`` whose entire (transitive) input
+    closure is initializers other than ``non_foldable_names`` -- in
+    practice, a quantization scheme's dequantization chain feeding a frozen
+    base weight (e.g. :func:`onnxsim.nf4.quantize_weight_only_nf4`'s
+    ``Cast -> Gather -> Reshape -> Reshape -> Mul -> Reshape``), which may
+    use an op :data:`onnxsim.graph_grad.SUPPORTED_OPS` has no rule for
+    (``Cast``) even though nothing needs a gradient through it: the LoRA
+    branch reads the block's own input, never the dequant chain's output.
+
+    Deliberately general rather than NF4-specific: any node whose inputs are
+    all constants is safe to fold regardless of which op or which
+    quantization scheme produced them, and this covers "LoRA on top of any
+    scheme with a non-differentiable dequant chain" uniformly.
+
+    ``non_foldable_names`` must include every LoRA target's own ``A``/``B``
+    initializer name -- these are trained, not fixed, so a node reading one
+    must never be folded into a constant, however constant-looking its other
+    inputs are.
+
+    :returns: ``(nodes with the folded run removed, new initializers holding
+            the folded values -- empty when nothing was foldable)``.
+    """
+    initializer_map = {t.name: t for t in model.graph.initializer}
+    constant_names = set(initializer_map) - set(non_foldable_names)
+
+    foldable_outputs = set(constant_names)
+    folded_nodes: List[onnx.NodeProto] = []
+    kept_nodes: List[onnx.NodeProto] = []
+    for node in nodes:
+        if node.input and all(
+            (not name) or name in foldable_outputs for name in node.input
+        ):
+            folded_nodes.append(node)
+            foldable_outputs.update(name for name in node.output if name)
+        else:
+            kept_nodes.append(node)
+
+    if not folded_nodes:
+        return list(nodes), []
+
+    folded_output_names = {name for n in folded_nodes for name in n.output if name}
+    boundary = sorted(
+        {
+            name
+            for node in kept_nodes
+            for name in node.input
+            if name in folded_output_names
+        }
+    )
+    if not boundary:
+        # Every consumer of the fold was itself folded away too -- nothing a
+        # kept node still needs, so there is nothing to materialize.
+        return kept_nodes, []
+
+    used_initializers = [
+        initializer_map[name]
+        for node in folded_nodes
+        for name in node.input
+        if name in initializer_map
+    ]
+    fold_graph = onnx.helper.make_graph(
+        folded_nodes,
+        "lora_fold",
+        [],
+        # A bare name, no declared type -- the same technique
+        # onnxsim.bias_correction._add_probe_outputs uses to expose an
+        # intermediate tensor as an output without knowing its type/shape
+        # ahead of time.
+        [onnx.ValueInfoProto(name=name) for name in boundary],
+        initializer=used_initializers,
+    )
+    fold_model = onnx.helper.make_model(
+        fold_graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
+    )
+    fold_model.ir_version = 8
+    values = backend.run_model(fold_model, {}, providers=None)
+
+    extra_initializers = [
+        onnx.numpy_helper.from_array(np.asarray(values[name]), name=name)
+        for name in boundary
+    ]
+    return kept_nodes, extra_initializers
+
+
+def _build_lora_step_graph(
+    adapter: LoraAdapter,
+    nodes: Sequence[onnx.NodeProto],
+    shapes: Dict[str, Sequence[int]],
+    block_initializers: Sequence[onnx.TensorProto],
+    externals: Dict[str, np.ndarray],
+    block_output_name: str,
+    block_output_shape: Sequence[int],
+    batch: Optional["qat._Minibatch"] = None,
+) -> qat_graph.StepGraph:
+    """The whole LoRA training step as one graph: block forward (base branch
+    + injected adapter branch, verbatim -- no substitution, since the base
+    weight is never a target), reconstruction loss, backward restricted to
+    the adapter's own ``A``/``B`` tensors, one Adam step each.
+
+    Modeled directly on :func:`onnxsim.qat._build_step_graph`'s ordering,
+    without the fake-quant/scale/activation-quantizer machinery that exists
+    only because that function's caller has a *quantizer* to train --
+    LoRA does not, so there is no substitution step: :func:`inject_lora`
+    already left the block's nodes exactly as they should run.
+    """
+    b = qat_graph.GraphBuilder(_PREFIX)
+    b.initializer.extend(block_initializers)
+
+    teacher = f"{_PREFIX}teacher"
+    constants: Dict[str, Tuple[Sequence[int], int]] = {}
+    if batch is None:
+        constants.update(
+            {
+                name: (list(value.shape), qat._np_elem_type(value.dtype))
+                for name, value in sorted(externals.items())
+            }
+        )
+        constants[teacher] = (list(block_output_shape), onnx.TensorProto.FLOAT)
+    else:
+        rows = batch.index_name
+        for name, value in sorted(externals.items()):
+            table = f"{_PREFIX}all_{name}"
+            constants[table] = (list(value.shape), qat._np_elem_type(value.dtype))
+            b.gather_rows(table, rows, name)
+        constants[f"{_PREFIX}teacher_all"] = (
+            list(block_output_shape),
+            onnx.TensorProto.FLOAT,
+        )
+        b.gather_rows(f"{_PREFIX}teacher_all", rows, teacher)
+        block_output_shape = [batch.size] + list(block_output_shape)[1:]
+
+    b.nodes.extend(nodes)
+
+    diff = b.sub(block_output_name, teacher)
+    n_elems = int(np.prod(list(block_output_shape)))
+    dl_dy = b.mul(diff, b.const(2.0 / n_elems))
+
+    targets = adapter.parameter_names()
+    # graph_grad.build_backward's shapes dict allows a dynamic (dim_param)
+    # entry, for callers (the distillation step graph) that need one -- this
+    # LoRA block's own shapes are always fully static, so the wider type
+    # here is just to match build_backward's signature, not a behavior
+    # change.
+    shapes_for_backward: Dict[str, Sequence[Union[int, str]]] = dict(shapes)
+    grads = graph_grad.build_backward(
+        b, nodes, shapes_for_backward, {block_output_name: dl_dy}, targets
+    )
+
+    state: Dict[str, Tuple[Sequence[int], str]] = {}
+    for param_name in targets:
+        g = grads[param_name]
+        shape = list(shapes[param_name])
+        m_in, v_in = f"{_PREFIX}m_{param_name}", f"{_PREFIX}v_{param_name}"
+        param_next, m_next, v_next = qat_graph.adam_update(
+            b, param_name, g, m_in, v_in, f"{_PREFIX}lr", "m_correction", "v_correction"
+        )
+        state[param_name] = (shape, param_next)
+        state[m_in] = (shape, m_next)
+        state[v_in] = (shape, v_next)
+
+    per_step: Optional[Dict[str, Tuple[Sequence[int], int]]] = None
+    if batch is not None:
+        per_step = {batch.index_name: ([batch.size], int(onnx.TensorProto.INT64))}
+
+    return qat_graph.make_step_graph(
+        b,
+        constants=constants,
+        state=state,
+        scalars=[f"{_PREFIX}lr", "m_correction", "v_correction"],
+        loss=b.mean_square(diff),
+        name="onnxsim_lora_step",
+        per_step=per_step,
+    )
+
+
+def _train_lora_block(
+    model: onnx.ModelProto,
+    adapter: LoraAdapter,
+    nodes: Sequence[onnx.NodeProto],
+    extra_initializers: Sequence[onnx.TensorProto],
+    external_values: Dict[str, np.ndarray],
+    teacher_output: np.ndarray,
+    block_output_name: str,
+    *,
+    num_iterations: int,
+    learning_rate: float,
+    lr_decay: bool,
+    batch_size: Optional[int],
+    shuffle: bool,
+    batch_seed: int,
+    step_providers: Optional[Sequence[backend.Provider]],
+    losses: Optional[List[float]],
+) -> onnx.ModelProto:
+    """Runs the LoRA training loop for one already-sliced, already-captured
+    block and returns ``model`` with the adapter's ``A``/``B`` initializers
+    rewritten. Mirrors :func:`onnxsim.qat._train_block`'s own structure.
+
+    ``extra_initializers`` are :func:`_fold_frozen_prefixes`'s output, if
+    any -- used only to build the step graph (whose own constants a folded
+    quantization dequant chain becomes, since the base weight never changes
+    across steps anyway) and never merged into the *returned* model, which
+    is built from ``model`` unchanged: the deployed model keeps its real
+    dequant chain, quantized weights included, exactly as
+    :func:`apply_qlora` produced it.
+    """
+    batch = qat._plan_minibatch(external_values, teacher_output, batch_size)
+    if batch is None:
+        block_inputs, block_target = external_values, teacher_output
+    else:
+        block_inputs = {k: v[: batch.size] for k, v in external_values.items()}
+        block_target = teacher_output[: batch.size]
+
+    shape_source = model
+    if extra_initializers:
+        shape_source = onnx.ModelProto()
+        shape_source.CopyFrom(model)
+        shape_source.graph.initializer.extend(extra_initializers)
+
+    shapes = qat._block_shapes(
+        shape_source, nodes, block_inputs, block_output_name, block_target
+    )
+
+    param_names = set(adapter.parameter_names())
+    used = {name for node in nodes for name in node.input if name}
+    initializer_map = {t.name: t for t in shape_source.graph.initializer}
+    block_initializers = [
+        t
+        for t in shape_source.graph.initializer
+        if t.name in used and t.name not in param_names
+    ]
+
+    step = _build_lora_step_graph(
+        adapter,
+        nodes,
+        shapes,
+        block_initializers,
+        external_values,
+        block_output_name,
+        list(teacher_output.shape),
+        batch,
+    )
+
+    if batch is None:
+        constants: Dict[str, np.ndarray] = dict(external_values)
+        constants[f"{_PREFIX}teacher"] = teacher_output
+    else:
+        constants = {f"{_PREFIX}all_{k}": v for k, v in external_values.items()}
+        constants[f"{_PREFIX}teacher_all"] = teacher_output
+
+    state: Dict[str, np.ndarray] = {}
+    for param_name in param_names:
+        value = onnx.numpy_helper.to_array(initializer_map[param_name]).astype(
+            np.float32
+        )
+        state[param_name] = value
+        state[f"{_PREFIX}m_{param_name}"] = np.zeros_like(value)
+        state[f"{_PREFIX}v_{param_name}"] = np.zeros_like(value)
+
+    def scalars(t: int) -> Dict[str, float]:
+        decay = 1.0 - t / num_iterations if lr_decay else 1.0
+        values = {f"{_PREFIX}lr": learning_rate * decay}
+        values.update(qat_graph.adam_bias_corrections(t))
+        return values
+
+    feeds = None
+    if batch is not None:
+        rows = qat_graph.minibatch_indices(
+            batch.num_rows, batch.size, seed=batch_seed, shuffle=shuffle
+        )
+        index_name = batch.index_name
+
+        def batch_rows(t: int) -> Dict[str, np.ndarray]:
+            return {index_name: rows(t)}
+
+        feeds = batch_rows
+
+    final = qat_graph.run_step_graph(
+        step,
+        constants=constants,
+        state=state,
+        num_steps=num_iterations,
+        scalars=scalars,
+        providers=step_providers,
+        losses=losses,
+        feeds=feeds,
+    )
+
+    tuned = onnx.ModelProto()
+    tuned.CopyFrom(model)
+    for initializer in tuned.graph.initializer:
+        if initializer.name in param_names:
+            initializer.CopyFrom(
+                onnx.numpy_helper.from_array(
+                    final[initializer.name].astype(np.float32), name=initializer.name
+                )
+            )
+    onnx.checker.check_model(tuned)
+    return tuned
+
+
+def train_lora(
+    model: Union[str, onnx.ModelProto],
+    adapter: LoraAdapter,
+    block_input_name: str,
+    block_output_name: str,
+    reference_model: Optional[Union[str, onnx.ModelProto]] = None,
+    target_data: Optional[Sequence[np.ndarray]] = None,
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    num_iterations: int = 1000,
+    learning_rate: float = 1e-3,
+    lr_decay: bool = True,
+    batch_size: Optional[int] = None,
+    shuffle: bool = True,
+    batch_seed: int = 0,
+    providers: Optional[Sequence[backend.Provider]] = None,
+    step_providers: Optional[Sequence[backend.Provider]] = None,
+    losses: Optional[List[float]] = None,
+) -> onnx.ModelProto:
+    """Trains an :func:`inject_lora`-injected adapter's ``A``/``B``
+    matrices, with the base model's own weights (and everything else outside
+    the adapter) held fixed.
+
+    The block is named the way :func:`onnxsim.apply_qat` names one, by its
+    input and output tensor -- and, exactly as there, passing the graph's own
+    input/output names trains the whole graph rather than a sub-block.
+
+    Exactly one of ``reference_model``/``target_data`` is required:
+
+    - ``reference_model``: label-free distillation. The block's own output
+      is trained to match this model's activation at ``block_output_name``
+      on the same calibration inputs -- see this module's docstring for why
+      that alone cannot teach a new task, only reproduce the reference.
+    - ``target_data``: the loss target directly, one array per
+      ``calibration_data`` batch (same axis-0-concatenation contract
+      :func:`onnxsim.qat._capture` uses) -- real supervised fine-tuning
+      against caller-supplied labels. Requires ``calibration_data`` to be
+      given explicitly too (there is nothing to randomly generate labels
+      for).
+
+    :param model: the LoRA-injected model (or file path) to train.
+    :param adapter: the :class:`LoraAdapter` :func:`inject_lora` returned for
+            ``model``.
+    :param block_input_name: the activation entering the block.
+    :param block_output_name: the block's own final output, whose
+            reconstruction error against the target is the loss.
+    :param reference_model: the teacher model (or file path); mutually
+            exclusive with ``target_data``.
+    :param target_data: caller-supplied loss targets; mutually exclusive
+            with ``reference_model``.
+    :param calibration_data: the block's input data. Random data is
+            generated when omitted and ``reference_model`` is used;
+            required when ``target_data`` is given.
+    :returns: ``model`` with the adapter's initializers trained. Every other
+            byte, base weights included, is untouched.
+    :raises ValueError: if neither or both of ``reference_model``/
+            ``target_data`` are given, if ``target_data`` is given without
+            ``calibration_data``, or if ``adapter`` has no targets.
+    :raises onnxsim.graph_grad.UnsupportedOpError: if any node in the block
+            has no gradient rule.
+    """
+    if (reference_model is None) == (target_data is None):
+        raise ValueError(
+            "train_lora needs exactly one of reference_model or target_data"
+        )
+    if not adapter.targets:
+        raise ValueError("adapter has no injected targets to train")
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+
+    nodes, externals = qat._slice_block(
+        model.graph, block_input_name, block_output_name
+    )
+    nodes, extra_initializers = _fold_frozen_prefixes(
+        nodes, model, adapter.parameter_names()
+    )
+    qat._refuse_unsupported(nodes)
+
+    if target_data is not None:
+        if calibration_data is None:
+            raise ValueError(
+                "target_data requires calibration_data -- the inputs it was "
+                "computed for, since there is nothing to randomly generate "
+                "labels for"
+            )
+    elif calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+
+    external_values = qat._capture(
+        model, sorted(set(externals)), calibration_data, providers
+    )
+
+    if reference_model is not None:
+        if isinstance(reference_model, str):
+            reference_model = onnx.load(reference_model, load_external_data=False)
+        teacher_output = qat._capture(
+            reference_model, [block_output_name], calibration_data, providers
+        )[block_output_name]
+    else:
+        assert target_data is not None  # guaranteed by the XOR check above
+        teacher_output = np.concatenate(
+            [np.asarray(t, dtype=np.float32) for t in target_data], axis=0
+        )
+
+    return _train_lora_block(
+        model,
+        adapter,
+        nodes,
+        extra_initializers,
+        external_values,
+        teacher_output,
+        block_output_name,
+        num_iterations=num_iterations,
+        learning_rate=learning_rate,
+        lr_decay=lr_decay,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        batch_seed=batch_seed,
+        step_providers=step_providers,
+        losses=losses,
+    )
+
+
+def apply_qlora(
+    model: Union[str, onnx.ModelProto],
+    rank: int = 8,
+    alpha: Optional[float] = None,
+    target_op_types: Sequence[str] = _ELIGIBLE_OP_TYPES,
+    target_names: Optional[Sequence[str]] = None,
+    block_size: int = 64,
+    seed: int = 0,
+) -> Tuple[onnx.ModelProto, LoraAdapter]:
+    """:func:`inject_lora`, then :func:`onnxsim.nf4.quantize_weight_only_nf4`
+    on everything except the freshly-injected adapters -- QLoRA: a low-rank
+    adapter trained on top of an NF4-quantized (4-bit) frozen base, the same
+    composition ``tools/onnx-finetune``'s ``prepare_qlora.py`` builds.
+
+    Order matters both ways: injection must happen first (NF4's matcher
+    needs a plain initializer-fed ``MatMul``/``Gemm``, which quantizing
+    first would replace with a dequant subgraph before injection ever saw
+    it), and the injected ``A``/``B`` names must be excluded from
+    quantization (``skip_names``) since they are otherwise indistinguishable
+    from any other small 2-D weight by shape alone.
+
+    Training the result works unmodified through :func:`train_lora` --
+    :func:`_fold_frozen_prefixes` there handles the dequant chain's ``Cast``
+    node, which :data:`onnxsim.graph_grad.SUPPORTED_OPS` has no rule for.
+
+    :param block_size: NF4's per-block scale group size; see
+            :func:`onnxsim.nf4.quantize_weight_only_nf4`.
+    :returns: ``(model with adapters injected and the base weights
+            NF4-quantized, the injected LoraAdapter)``.
+    """
+    injected, adapter = inject_lora(
+        model,
+        rank=rank,
+        alpha=alpha,
+        target_op_types=target_op_types,
+        target_names=target_names,
+        seed=seed,
+    )
+    quantized = nf4.quantize_weight_only_nf4(
+        injected, block_size=block_size, skip_names=adapter.parameter_names()
+    )
+    return quantized, adapter
+
+
+@dataclass
+class LoraBlock:
+    """One trainable block :func:`discover_lora_blocks` found, named the way
+    a caller would name one for :func:`train_lora` by hand.
+
+    ``input_name``/``output_name`` are exactly what a caller would pass as
+    :func:`train_lora`'s ``block_input_name``/``block_output_name``, so a
+    plan is inspectable, diffable and replayable one block at a time.
+    """
+
+    input_name: str
+    output_name: str
+    #: The injected adapters' own :attr:`LoraTarget.node_output` tensors that
+    #: fall inside this block, in graph order. Never empty: a slice with no
+    #: adapter to train is not a block.
+    target_outputs: Tuple[str, ...]
+    #: Tensors the block reads but does not produce, ``input_name`` included.
+    #: These are teacher-forced -- see :func:`onnxsim.qat._slice_block`.
+    external_inputs: Tuple[str, ...]
+    #: Op types inside the block, deduplicated and sorted.
+    op_types: Tuple[str, ...]
+    num_nodes: int
+
+
+def discover_lora_blocks(
+    model: Union[str, onnx.ModelProto],
+    adapter: LoraAdapter,
+    max_targets_per_block: int = 2,
+) -> List[LoraBlock]:
+    """Partitions ``model`` into a sequence of blocks :func:`train_lora` can
+    train, without the caller naming a single ``block_input_name``/
+    ``block_output_name`` pair -- :func:`onnxsim.qat.discover_qat_blocks`'s
+    liveness argument, adapted to LoRA's own shape of problem.
+
+    The underlying question is identical to QAT's: a slice is trainable iff
+    it is (1) **differentiable** -- every op inside is in
+    :data:`onnxsim.graph_grad.SUPPORTED_OPS` -- and (2) **self-contained** --
+    cuttable out of the graph without severing an activation something else
+    still uses. :func:`onnxsim.qat._liveness_cuts` answers (2) by liveness,
+    not by recognizing architectures; this function reuses it verbatim on
+    ``model``'s own graph. Unlike QAT -- which differentiates a float graph
+    and reconstructs a separately quantized one -- LoRA trains directly
+    against the one already-injected model :func:`inject_lora`/
+    :func:`apply_qlora` produced, so there is no second graph to keep in
+    sync.
+
+    Where this differs from QAT's discovery: "at least one quantized layer"
+    becomes "at least one injected adapter" -- a span closes a block once it
+    has accumulated ``max_targets_per_block`` of ``adapter``'s own
+    :attr:`LoraTarget.node_output` tensors, the same tensor
+    :func:`inject_lora` restored the original node's name to, so every
+    non-adapter consumer downstream is unaffected by which block boundary
+    falls where.
+
+    **What this does not see.** :func:`_fold_frozen_prefixes` lets
+    :func:`train_lora` train straight through a frozen dequant chain (NF4's
+    ``Cast``, say) that has no rule in ``SUPPORTED_OPS`` -- but this function
+    has no notion of "frozen": it treats every unsupported op as a hard gap,
+    the same conservative-not-incorrect trade-off
+    :func:`onnxsim.qat.discover_qat_blocks` documents for itself. Run this on
+    an :func:`apply_qlora` model and it may propose fewer or smaller blocks
+    than an :func:`apply_qlora` + hand-named :func:`train_lora` call could
+    actually train; it never proposes one that cannot train.
+
+    :param model: the model with adapters already injected, as returned by
+            :func:`inject_lora`/:func:`apply_qlora`. Boundaries are found in
+            *this* graph -- the one :func:`train_lora` differentiates.
+    :param adapter: the :class:`LoraAdapter` :func:`inject_lora`/
+            :func:`apply_qlora` returned alongside ``model``.
+    :param max_targets_per_block: how many injected adapters to merge into
+            one block before closing it. 1 gives per-adapter blocks; a large
+            value gives one block per gap between undifferentiable ops -- on
+            a model with no such gap, the whole graph as a single block.
+    :returns: the blocks in graph order, possibly empty. Consecutive blocks
+            need not be adjacent: a gap between two of them is a region
+            nothing here can train.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if max_targets_per_block < 1:
+        raise ValueError("max_targets_per_block must be at least 1")
+
+    graph = model.graph
+    cuts = qat._liveness_cuts(graph, qat._primary_graph_input(graph))
+    target_outputs = {t.node_output for t in adapter.targets}
+
+    pairs: List[Tuple[str, str]] = []
+    start: Optional[Tuple[int, str]] = cuts[0] if cuts else None
+    count = 0
+    supported = graph_grad.supported_ops()
+    for previous, current in zip(cuts, cuts[1:]):
+        span = graph.node[previous[0] + 1 : current[0] + 1]
+        if any(node.op_type not in supported for node in span):
+            # A gap. Close whatever was pending before it and reopen after.
+            if start is not None and count and start[0] < previous[0]:
+                pairs.append((start[1], previous[1]))
+            start, count = current, 0
+            continue
+        if start is None:
+            start = previous
+        count += sum(1 for node in span for out in node.output if out in target_outputs)
+        if count >= max_targets_per_block:
+            pairs.append((start[1], current[1]))
+            start, count = current, 0
+    if start is not None and count and cuts and start[0] < cuts[-1][0]:
+        pairs.append((start[1], cuts[-1][1]))
+
+    blocks: List[LoraBlock] = []
+    for input_name, output_name in pairs:
+        try:
+            nodes, externals = qat._slice_block(graph, input_name, output_name)
+        except ValueError:
+            # Defensive, matching discover_qat_blocks: the span construction
+            # above already guarantees a non-empty, supported slice.
+            continue
+        block_outputs = {out for node in nodes for out in node.output}
+        block_targets = tuple(
+            t.node_output for t in adapter.targets if t.node_output in block_outputs
+        )
+        if not block_targets:
+            continue
+        blocks.append(
+            LoraBlock(
+                input_name=input_name,
+                output_name=output_name,
+                target_outputs=block_targets,
+                external_inputs=tuple(externals),
+                op_types=tuple(sorted({n.op_type for n in nodes})),
+                num_nodes=len(nodes),
+            )
+        )
+    return blocks
+
+
+def export_lora_adapter(
+    model: onnx.ModelProto,
+    adapter: LoraAdapter,
+    path: str,
+    adapter_version: int = 0,
+    model_version: int = 0,
+) -> None:
+    """Exports a trained adapter's ``A``/``B`` values to ONNX Runtime's own
+    native ``.onnx_adapter`` format (``onnxruntime.AdapterFormat``, added in
+    ORT 1.20) -- the format ``RunOptions.add_active_adapter``/
+    ``onnxruntime.LoraAdapter`` swap in at inference time, the same one
+    ``tools/onnx-finetune``'s ``export_onnx_adapter.py`` produces.
+
+    A general ORT >=1.20 *inference-side* feature, not training-build
+    -specific: the plain ``pip install onnxruntime`` package has it, unlike
+    everything ``tools/onnx-finetune`` itself needs.
+
+    ``model`` here is not declared with ``lora_A``/``lora_B`` as graph
+    *inputs* the way ``tools/onnx-finetune``'s ``--adapter-inputs`` mode
+    does (a separate, live-adapter-swap feature this module does not
+    build) -- so the exported file round-trips through
+    :meth:`onnxruntime.AdapterFormat.read_adapter`/``get_parameters`` with
+    the trained values, but is not itself something
+    ``RunOptions.add_active_adapter`` can swap into *this* model at
+    inference time.
+
+    :param model: the trained model :func:`train_lora` returned.
+    :param adapter: the same :class:`LoraAdapter` used to train it.
+    :param path: where to write the ``.onnx_adapter`` file.
+    :param adapter_version: stored in the file; ORT surfaces it back on load.
+    :param model_version: stored in the file; ORT surfaces it back on load.
+    :raises ImportError: if onnxruntime is not installed, or is installed
+            without ``AdapterFormat`` support (before 1.20).
+    """
+    try:
+        import onnxruntime as ort
+    except ImportError as e:
+        raise ImportError(
+            "export_lora_adapter needs the optional 'onnxruntime' package: "
+            "pip install onnxruntime"
+        ) from e
+    if not hasattr(ort, "AdapterFormat"):
+        raise ImportError(
+            f"export_lora_adapter needs an onnxruntime build with AdapterFormat "
+            f"export support (onnxruntime >= 1.20); found onnxruntime "
+            f"{ort.__version__}, which does not have it. pip install -U onnxruntime"
+        )
+
+    initializer_map = {t.name: t for t in model.graph.initializer}
+    params = {
+        name: ort.OrtValue.ortvalue_from_numpy(
+            onnx.numpy_helper.to_array(initializer_map[name])
+        )
+        for name in adapter.parameter_names()
+    }
+    fmt = ort.AdapterFormat()
+    fmt.set_parameters(params)
+    fmt.set_adapter_version(adapter_version)
+    fmt.set_model_version(model_version)
+    fmt.export_adapter(path)

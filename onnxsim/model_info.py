@@ -20,9 +20,8 @@ import numpy as np
 import onnx
 from onnx import defs, helper, numpy_helper, shape_inference
 from onnx.external_data_helper import ExternalDataInfo, uses_external_data
-from rich import print
-from rich.table import Table
-from rich.text import Text
+
+from onnxsim._rich_compat import Table, Text, print
 
 try:
     import sympy
@@ -33,6 +32,13 @@ try:
     from onnx import inliner as onnx_inliner
 except ImportError:  # onnx.inliner was added in onnx 1.14; see ModelInfo.__init__.
     onnx_inliner = None
+
+try:
+    import onnx_ir
+    from onnx_shape_inference import infer_symbolic_shapes
+except ImportError:  # optional dependency; see ModelInfo._infer_shapes below.
+    onnx_ir = None
+    infer_symbolic_shapes = None
 
 
 __all__ = [
@@ -172,13 +178,28 @@ def _is_symbolic(value: Macs) -> bool:
     )
 
 
+# sympy.factor() on a multivariate polynomial is at best exponential in its
+# number of free symbols. Real models with properly-named/deduplicated dynamic
+# dims (e.g. "batch", "sequence") only ever contribute a handful of distinct
+# symbols, but a model whose shape inference didn't unify intermediate dynamic
+# dims back to the named input dims can produce hundreds of distinct symbols --
+# there factor() doesn't error, it just never returns in practical time. Skip
+# it above this threshold; it is purely a formatting nicety, never worth more
+# than a bounded amount of work.
+_MAX_FACTOR_FREE_SYMBOLS = 16
+
+
 def _factor_or_str(value: "sympy.Expr") -> str:
     # sympy.factor() is purely cosmetic here (a nicer-looking formula for the
     # report), but on models with many unresolved symbolic dims its polynomial
     # arithmetic can recurse deep enough to blow Python's recursion limit (seen
     # in practice on real-world models with 1000+ nodes, e.g. VOICEVOX's
-    # predict_sing_f0.onnx). Fall back to the unfactored expression rather than
-    # crashing the whole report over a formatting nicety.
+    # predict_sing_f0.onnx), or simply take intractably long without ever
+    # erroring (see ``_MAX_FACTOR_FREE_SYMBOLS`` above). Fall back to the
+    # unfactored expression rather than crashing or hanging the whole report
+    # over a formatting nicety.
+    if len(value.free_symbols) > _MAX_FACTOR_FREE_SYMBOLS:
+        return str(value)
     try:
         return str(sympy.factor(value))
     except RecursionError:
@@ -189,8 +210,14 @@ def _representative_number(value: Macs) -> int:
     # Collapse a (possibly symbolic) MAC count to a single number by setting
     # every free dimension to 1. Used only for ordering and the summary table's
     # highlighting -- never for the reported value, which stays symbolic.
+    # ``xreplace`` (a direct, purely syntactic tree substitution), not ``subs``
+    # (which layers on structural-equality/simplification passes meant for
+    # pattern-based substitution): every replacement here is an exact Symbol
+    # swapped for a literal, and ``subs`` on that over hundreds of free symbols
+    # -- as models with undeduplicated dynamic dims can produce -- takes
+    # minutes where ``xreplace`` takes a fraction of a second.
     if sympy is not None and isinstance(value, sympy.Expr):
-        value = value.subs({s: 1 for s in value.free_symbols})
+        value = value.xreplace({s: sympy.Integer(1) for s in value.free_symbols})
     return int(value)
 
 
@@ -533,10 +560,15 @@ class ModelInfo:
     Model info contains:
     1. Num of every op
     2. Model size
-    3. MACs / FLOPs of the compute-dominant operators: Conv, ConvTranspose,
+    3. Count of the top-level graph's own initializers (``initializer_count``)
+    4. MACs / FLOPs of the compute-dominant operators: Conv, ConvTranspose,
        Gemm, MatMul, Attention, and the quantized twins (ConvInteger,
        QLinearConv, MatMulInteger, QLinearMatMul). Shapes come from ONNX shape
-       inference; nodes whose shapes cannot be inferred contribute 0. Dynamic
+       inference -- or, when the optional ``onnx-shape-inference`` package
+       (https://github.com/justinchuby/onnx-shape-inference) is installed, its
+       symbolic shape inference, which resolves more shapes via data
+       propagation through chains like Shape -> Slice -> Concat -> Reshape;
+       nodes whose shapes still cannot be inferred contribute 0. Dynamic
        dimensions (``dim_param``, e.g. "batch") become sympy symbols when sympy
        is installed, so ``macs`` / ``flops`` may be a symbolic formula; without
        sympy they are assumed 1 (per-sample MACs). Function ops are expanded
@@ -545,7 +577,7 @@ class ModelInfo:
        functions (and nested ones) are inlined, and schema-registered function
        ops without a bespoke counter fall back to their context-dependent body
        (best-effort).
-    4. Memory metrics, derived statically from the same inferred shapes (no
+    5. Memory metrics, derived statically from the same inferred shapes (no
        runtime execution needed):
        - ``mem_access``: total bytes read and written across a forward pass --
          every node's inputs (weights included) plus its outputs.
@@ -617,6 +649,13 @@ class ModelInfo:
         # whether or not the weights on disk have been loaded).
         op_nums, self.model_size, macs, mem_access, footprint = _cpp_metrics(model)
         self.op_nums = defaultdict(int, op_nums)
+        # The top-level graph's own initializer count -- unlike
+        # ``op_nums["Constant"]``, which folds initializers (recursively,
+        # subgraphs included) together with actual ``Constant`` nodes, this is
+        # reported as its own "Initializers" row so a change there (weights
+        # folded into a fused node, duplicate initializers deduplicated, ...)
+        # is visible on its own.
+        self.initializer_count = len(model.graph.initializer)
         # A function op's compute lives in its body, so recount MACs and the
         # memory metrics on the function-expanded (inlined) graph -- the counters
         # then see the MatMuls, Convs, etc. inside every function instance. The
@@ -663,6 +702,22 @@ class ModelInfo:
     def _infer_shapes(
         model: onnx.ModelProto, data_prop: bool = False
     ) -> onnx.ModelProto:
+        # onnx-shape-inference (https://github.com/justinchuby/onnx-shape-inference),
+        # when installed, resolves more shapes than onnx's own shape_inference: it
+        # always does data propagation and tracks values through chains like
+        # Shape -> Slice -> Concat -> Reshape, so dynamic reshapes that onnx leaves
+        # unknown often still get a shape here. Its dim_param names for dynamic
+        # dims are still picked up as sympy symbols by _tensor_shape below.
+        if infer_symbolic_shapes is not None:
+            try:
+                inferred = infer_symbolic_shapes(onnx_ir.from_proto(model))
+                return onnx_ir.to_proto(inferred)
+            except Exception as e:
+                warnings.warn(
+                    f"onnx-shape-inference failed ({e}); falling back to "
+                    "onnx.shape_inference.",
+                    stacklevel=2,
+                )
         try:
             return shape_inference.infer_shapes(model, data_prop=data_prop)
         except Exception as e:
@@ -814,6 +869,13 @@ def print_simplifying_info(
         opt_info.model_size,
         lambda opt, ori: opt < ori,
         postprocess=human_readable_size,
+    )
+    add_row(
+        table,
+        "Initializers",
+        ori_info.initializer_count,
+        opt_info.initializer_count,
+        lambda opt, ori: opt < ori,
     )
 
     # MACs/FLOPs may be symbolic, for which "<" yields an undecidable sympy

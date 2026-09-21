@@ -381,6 +381,7 @@ ModelInfo GetModelInfo(const onnx::ModelProto& model,
                        bool run_shape_inference) {
   ModelInfo info;
   CountGraphOps(model.graph(), info.op_nums);
+  info.initializer_count = model.graph().initializer_size();
   // ByteSizeLong() (not the 32-bit ByteSize()) so models above 2GB do not
   // overflow; external tensor data is then added from metadata. Op counts and
   // size come from the model as given -- not the shape-inferred copy below,
@@ -388,6 +389,16 @@ ModelInfo GetModelInfo(const onnx::ModelProto& model,
   info.model_size = static_cast<int64_t>(model.graph().ByteSizeLong()) +
                     ExternalDataSize(model.graph());
 
+  const GraphView view = GetGraphView(model, run_shape_inference);
+  const Metrics metrics = onnxsim::ComputeMetrics(view);
+  info.macs = metrics.macs;
+  info.mem_access = metrics.mem_access;
+  info.memory_footprint = onnxsim::PeakMemoryFootprint(view);
+  return info;
+}
+
+onnxsim::GraphView GetGraphView(const onnx::ModelProto& model,
+                                bool run_shape_inference) {
   // The compute/memory metrics need tensor shapes. By default run shape
   // inference on a copy (it mutates in place). Best-effort: if it throws (e.g.
   // models > 2GB), fall back to whatever value_info the model already carries
@@ -404,12 +415,7 @@ ModelInfo GetModelInfo(const onnx::ModelProto& model,
     }
     graph = &inferred.graph();
   }
-  const GraphView view = BuildGraphView(*graph, ShapeMap{}, DTypeMap{});
-  const Metrics metrics = onnxsim::ComputeMetrics(view);
-  info.macs = metrics.macs;
-  info.mem_access = metrics.mem_access;
-  info.memory_footprint = onnxsim::PeakMemoryFootprint(view);
-  return info;
+  return BuildGraphView(*graph, ShapeMap{}, DTypeMap{});
 }
 
 std::string FormatSimplifyingInfo(const onnx::ModelProto& model_ori,
@@ -436,6 +442,11 @@ std::string FormatSimplifyingInfo(const onnx::ModelProto& model_ori,
   std::string size_cell = HumanReadableSize(opt.model_size);
   if (opt.model_size < ori.model_size) size_cell += " *";
   rows.push_back({"Model Size", HumanReadableSize(ori.model_size), size_cell});
+
+  std::string init_cell = std::to_string(opt.initializer_count);
+  if (opt.initializer_count < ori.initializer_count) init_cell += " *";
+  rows.push_back(
+      {"Initializers", std::to_string(ori.initializer_count), init_cell});
 
   // Symbolic metric rows: a smaller representative magnitude (every dynamic dim
   // -> 1) counts as the improvement, since "<" on a genuine formula is not
