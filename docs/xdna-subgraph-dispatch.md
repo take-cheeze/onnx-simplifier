@@ -597,11 +597,79 @@ layers); max pools take any kernel/padding/`ceil_mode` (GoogLeNet, SqueezeNet); 
 into the conv and a downsample skip fuses the Add itself; 3x3 convs on maps whose width is not 1/2/4/multiple of 8
 (SqueezeNet's 7x7) use the gather path (the padded-copy path assumed whole 8-pixel row segments).
 
-Not supported: ShuffleNet (channel shuffle = Reshape/Transpose on unaligned channel counts, 14 host round trips),
-DenseNet (BatchNorm not folded into a conv: 66), EfficientNet / ConvNeXt (maps over 64 pixels per channel block
-in the middle of the network: the SE / LayerNorm ops would need the host to read engine outputs back in the same
-launch), and any 224x224 input (needs the pixel-tiled layouts noted above). GoogLeNet is where Vitis AI is ahead
-(9 inception blocks of 1x1/3x3/5x5 branches: 97 sequential jobs at ~10 us each versus Vitis's fused subgraphs).
+Still not supported: EfficientNet / ConvNeXt (mid-network maps over 64 pixels per channel block; see the coverage
+section below) and any 224x224 input. GoogLeNet is where Vitis AI is ahead (9 inception blocks of 1x1/3x3/5x5
+branches: 99 sequential jobs at ~10 us each versus Vitis's fused subgraphs). ShuffleNet and DenseNet, listed as
+unsupported in the first version of this section, are covered now (next section).
+
+#### Operator coverage: layer engine vs Vitis AI
+
+How this was measured: Vitis AI EP 1.8 (XDNA2) was run with ORT profiling on each model and the nodes that ran on
+`CPUExecutionProvider` counted (`graph ops` below are the original ONNX nodes; Vitis rewrites the graph before
+partitioning, so its counts are fallbacks after its own passes). For the engine, "float host ops" are the nodes
+`compile_graph` leaves as float host nodes, without the Quantize/Dequantize/Constant bookkeeping. Models are 32x32
+QDQ graphs from `quantize_pow2_graph.py`; ours are all bit-exact against ORT on every boundary.
+
+| model | Vitis AI: ops falling back to CPU | engine before this work: float host ops (launches) | engine now: float host ops (launches) | Vitis AI ms | engine ms |
+|---|---|---|---|---|---|
+| ResNet-18 / 34 / 50 | 0 | Flatten + Gemm (1) | **0** (1) | 0.83 / 1.42 / 1.63 | 1.3 / 1.7 / 2.1 |
+| MobileNetV2 | 20 (FusedConv, GAP, Flatten) | 2 (1) | 2 (1) | 3.08 | 2.1 |
+| MobileNetV3-Small | 42 (HardSigmoid, Mul, Gemm, GAP) | 4 (1) | **0** (1) | 4.64 | 2.0 |
+| MnasNet | 2 (ReduceMean, Gemm) | 2 (1) | **0** (1) | 1.21 | 2.6 |
+| ShuffleNetV2 | 50 (Reshape x32, Transpose x16) | 145 (**14**) | **0** (1) | 3.79 | **1.5** |
+| DenseNet-121 | 167 (BatchNorm x62, Relu x62, QLinearConcat) and the compile crashes | 127 (**66**) | **0** (1) | - | **4.4** |
+| EfficientNet-B0 | 239 (Conv x81, SiLU Sigmoid/Mul x98, GAP, ...) | compile fails | compile fails | 4.67 | - |
+| ConvNeXt-T | 254 (LayerNorm, Gelu, Gemm x37, Reshape/Transpose) | compile fails | compile fails | 14.7 | - |
+| YOLOv8n | 19 (Concat, Reshape, Add, Sub, Sigmoid, Softmax, ...) | 24 (1) | 24 (1) | 3.29 | 2.4 |
+| YOLO11n / YOLOv10n | Vitis compile crashes | 34 (2) | 34 (2) | - | 5.3 / 5.1 |
+| transformer encoder, 2 layers | 0 (float graph, bf16) | 20 (3) | **0** (1) | 4.25 | **0.76** |
+
+Operator by operator (Vitis column = observed on these models, not a spec):
+
+| operator | layer engine | Vitis AI |
+|---|---|---|
+| Conv 1x1 / 3x3 / strided, any channel count (rows padded to 8) | yes | yes |
+| depthwise 1x1 (BatchNorm) / 3x3 / 5x5 / 7x7 | yes | yes (3x3/5x5; MobileNetV2's FusedConv falls back) |
+| grouped Conv | as a block-diagonal dense conv (extra MACs) | yes |
+| ConvTranspose | kernel == stride (conv + depth-to-space) | partly |
+| standalone BatchNorm (+ Relu) | as a depthwise 1x1 conv | falls back (DenseNet) |
+| Add, Add+Relu, Mul (gate / same shape) | yes (Add fused into the conv) | yes (SiLU/HardSigmoid Mul falls back) |
+| Relu, Clip(0,6), Sigmoid, SiLU, HardSwish, HardSigmoid, GELU, Exp, Reciprocal, Sqrt, Erf, Tanh | one 256-entry table job each (any pointwise chain) | Relu/Clip yes; the rest fall back |
+| MaxPool any k/pad/ceil_mode, AveragePool, GlobalAveragePool / ReduceMean(H,W) | yes (power-of-two windows for averages) | yes |
+| Concat, Split, Slice | yes, including channel counts that are not multiples of 8 (channel-gather job) | yes (QLinearConcat falls back in DenseNet) |
+| channel shuffle (Reshape/Transpose/Reshape) | channel-gather job | falls back (48 ops in ShuffleNet) |
+| Resize (nearest, integer factor) | yes | yes |
+| Flatten + Gemm | Flatten = copy job, Gemm = 1x1 conv | falls back (Gemm on CPU in 4 of the models) |
+| MatMul activation x activation (attention) | `amm` job (multiple-of-8 tokens) | bf16 path |
+| Softmax, LayerNormalization | decomposed into conv / product / table jobs | falls back in the QDQ path (ConvNeXt), bf16 path for float graphs |
+| Reshape / Transpose in general | host (only the shuffle and attention-head patterns are recognised) | partly |
+| activation maps over 16 KB / 64 px per channel block | **no** (host chain, or compile error) | yes (tiles through the memtile) |
+| scales that are not powers of two | via `onnx_to_engine.py` requantization (not bit-exact to the source) | yes (per-channel scales) |
+| per-channel weight scales | no (one shift per job) | yes |
+
+What closed the gaps, all in `layer_engine_graph.py` / `quantize_pow2_graph.py` unless noted: Gemm/Flatten/
+ReduceMean tails run on the engine, so classification nets end with no host operator; standalone BatchNorm is a
+depthwise 1x1 conv (the quantizer emits it, `dw` accepts K=1); `cgather` (kernel mode 14, `Job.chan_spec`) gathers
+arbitrary channels, which covers Slice/Split/Concat at channel counts like 58 and the channel shuffle (the
+compiler tracks the real channel count of every tensor from ONNX shape inference and pads conv rows to 8); a Q over
+a DQ of an engine tensor (what onnxsim leaves of a single-input Concat) becomes a re-scale copy or nothing; a
+DenseNet-style Concat that grows by one tensor reuses the previous concat (723 -> 246 jobs); the kernel data
+memory now sizes its partial-sum buffer to the widest multi-chunk job.
+
+`onnx_to_engine.py MODEL.onnx OUT.onnx [--report]` makes any model engine-ready: float models are calibrated and
+quantized, QDQ models with arbitrary scales have their activation Q/DQ pairs removed (a zero-point-0 uint8 Q that a
+QDQ quantizer used to fold a Relu/Clip into gets its Relu back), weights dequantized and the graph requantized with
+power-of-two scales, and already-compatible QDQ is copied. It is not bit-exact to the source QDQ model: on
+ImageNet-pretrained torchvision models at 32x32 (ORT static QDQ as the source, fp32 as the reference) the output
+cosine to fp32 is ResNet-18 0.995 (ORT QDQ) vs 0.980 (ours), SqueezeNet 0.999 vs 0.988, MobileNetV2 0.78 vs 0.64:
+per-tensor power-of-two weights cost accuracy on depthwise-heavy nets.
+
+Remaining gaps versus Vitis AI, and why: (1) **large activation maps**: every core holds its whole input map in a 16 KB
+object and writes <= 512 B, so a 224x224 network, EfficientNet's and ConvNeXt's mid-network maps do not fit;
+pixel-banding them would need hundreds of jobs per layer (this engine is a small-map design by construction, and
+the 16 KB/512 B limits are the same ones that cap transformers at 32-64 tokens); (2) **per-channel weight scales and
+non-power-of-two multipliers** (one `to_vector<int8>(shift)` per job); (3) the YOLO decode tail (Concat/Reshape/
+Sub/Add/Softmax over float) stays on the host, about 0.1-0.4 ms.
 
 #### Transformers: layer engine vs Vitis AI vs Hexagon HTP
 
