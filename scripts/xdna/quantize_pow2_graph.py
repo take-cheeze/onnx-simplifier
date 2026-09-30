@@ -144,9 +144,54 @@ def quantize(fp32_path: Path, out_path: Path, seed: int = 0, samples: int = 4) -
         if name and name not in dq_of and name not in init and name in absmax:
             qdq(name)
 
+    def qweights(n: str, x: str, w: np.ndarray, b: np.ndarray) -> tuple[str, str]:
+        """int8 power-of-two weight and bias DequantizeLinear nodes for ``n``; returns their output names."""
+        w_scale = _pow2_up(float(np.abs(w).max()) / 127.0)
+        bias_scale = max(_pow2_up(float(np.abs(b).max()) / 127.0), scale_of[x] * w_scale)
+        for kind, arr, sc in (("w", w, w_scale), ("b", b, bias_scale)):
+            q = np.clip(np.rint(arr / sc), -128, 127).astype(np.int8)
+            nodes.append(
+                helper.make_node(
+                    "DequantizeLinear",
+                    [const(f"{n}_{kind}q", q), const(f"{n}_{kind}s", np.float32(sc)), const(f"{n}_{kind}z", np.int8(0))],
+                    [f"{n}_{kind}"],
+                    name=f"{n}_{kind}DQ",
+                )
+            )
+        return f"{n}_w", f"{n}_b"
+
+    skip: set[str] = set()
+    after_shuffle: dict[str, float] = {}
+
+    def shuffle_of(node):
+        """(Transpose, final Reshape) when ``node`` starts Reshape -> Transpose [0, 2, 1, 3, 4] -> Reshape."""
+        after = consumers.get(node.output[0], [])
+        if len(after) != 1 or after[0].op_type != "Transpose":
+            return None
+        if list(next((a.ints for a in after[0].attribute if a.name == "perm"), [])) != [0, 2, 1, 3, 4]:
+            return None
+        last = consumers.get(after[0].output[0], [])
+        return (after[0], last[0]) if len(last) == 1 and last[0].op_type == "Reshape" else None
+
+    graph_outputs = {o.name for o in graph.output}
+    renamed: dict[str, str] = {}
+
+    def qdq_output(tensor: str, scale: float | None = None) -> None:
+        """Q/DQ after ``tensor``; a network output keeps its name as the DequantizeLinear's alias."""
+        qdq(tensor, scale)
+        if tensor in graph_outputs:
+            nodes.append(helper.make_node("Identity", [dq_of[tensor]], [f"{tensor}_final"], name=f"{tensor}_final"))
+            renamed[tensor] = f"{tensor}_final"
+
     qdq(graph.input[0].name, 2.0**-7)
     for node in graph.node:
         op = node.op_type
+        if node.name in skip:
+            continue
+        if node.name in after_shuffle:
+            emit(node, list(node.input))
+            qdq(node.output[0], after_shuffle[node.name])
+            continue
         if op in ("Conv", "ConvTranspose") and node.input[0] not in dq_of:
             ensure_q(node.input[0])
         elif op in ("Add", "Concat") and any(i in dq_of for i in node.input if i):
@@ -160,6 +205,8 @@ def quantize(fp32_path: Path, out_path: Path, seed: int = 0, samples: int = 4) -
         elif op == "Identity" and node.input[0] in dq_of:
             dq_of[node.output[0]] = dq_of[node.input[0]]
             scale_of[node.output[0]] = scale_of[node.input[0]]
+            if node.output[0] in graph_outputs:  # the network output is the DequantizeLinear result itself
+                nodes.append(helper.make_node("Identity", [dq_of[node.input[0]]], list(node.output), name=node.name))
         elif op == "ConvTranspose" and node.input[0] in dq_of:
             x, w = node.input[0], init[node.input[1]]  # weights [ic][oc][kh][kw]
             b = init[node.input[2]] if len(node.input) > 2 else np.zeros(w.shape[1], dtype=np.float32)
@@ -261,6 +308,38 @@ def quantize(fp32_path: Path, out_path: Path, seed: int = 0, samples: int = 4) -
         elif op == "Resize" and all_quantized(node, [0]):
             emit(node, [dq_of[node.input[0]]] + list(node.input[1:]))
             qdq(node.output[0])
+        elif op == "Reshape" and node.input[0] in dq_of and shuffle_of(node) is not None:
+            transpose, back = shuffle_of(node)  # channel shuffle: one Q/DQ after the Reshape/Transpose/Reshape, same scale
+            emit(node, [dq_of[node.input[0]]] + list(node.input[1:]))
+            nodes.append(transpose)
+            skip.add(transpose.name)
+            after_shuffle[back.name] = scale_of[node.input[0]]  # emitted when the loop reaches it (its shape constant may come later)
+        elif op == "BatchNormalization" and node.input[0] in dq_of and node.input[1] in init:
+            # standalone (pre-activation) BatchNorm = a per-channel affine: a depthwise 1x1 conv with int8 weights
+            x, (gamma, beta, mean, var) = node.input[0], [init[i] for i in node.input[1:5]]
+            eps = next((a.f for a in node.attribute if a.name == "epsilon"), 1e-5)
+            w = (gamma / np.sqrt(var + eps)).astype(np.float32)
+            wn, bn = qweights(node.name, x, w.reshape(-1, 1, 1, 1), (beta - mean * w).astype(np.float32))
+            conv = helper.make_node("Conv", [dq_of[x], wn, bn], list(node.output), name=node.name, kernel_shape=[1, 1], group=int(w.size))
+            nodes.append(conv)
+            after = consumers.get(node.output[0], [])
+            if not (len(after) == 1 and after[0].op_type in ("Relu", "Clip")):
+                qdq(node.output[0])
+            else:
+                raw_conv.add(node.output[0])
+        elif op == "Gemm" and node.input[0] in dq_of and node.input[1] in init:
+            w = init[node.input[1]]
+            w = w if next((a.i for a in node.attribute if a.name == "transB"), 0) else w.T  # [out][in]
+            b = init[node.input[2]] if len(node.input) > 2 else np.zeros(w.shape[0], dtype=np.float32)
+            wn, bn = qweights(node.name, node.input[0], w, b)
+            nodes.append(helper.make_node("Gemm", [dq_of[node.input[0]], wn, bn], list(node.output), name=node.name, transB=1))
+            qdq_output(node.output[0])
+        elif op == "Flatten" and node.input[0] in dq_of:
+            emit(node, [dq_of[node.input[0]]])
+            qdq(node.output[0], scale_of[node.input[0]])
+        elif op == "ReduceMean" and node.input[0] in dq_of:
+            emit(node, [dq_of[node.input[0]]])
+            qdq(node.output[0])
         elif (
             op in ("MaxPool", "AveragePool", "GlobalAveragePool")
             and node.input[0] in dq_of
@@ -269,6 +348,17 @@ def quantize(fp32_path: Path, out_path: Path, seed: int = 0, samples: int = 4) -
             qdq(node.output[0], scale_of[node.input[0]] if op == "MaxPool" else None)
         else:
             emit(node, q_in(node))  # float region: fed from DequantizeLinear outputs
+    for tensor, final in renamed.items():  # the quantized value takes over the network output's name
+        for node in nodes:
+            for i, o in enumerate(node.output):
+                if o == tensor:
+                    node.output[i] = f"{tensor}_float"
+            for i, name in enumerate(node.input):
+                if name == tensor:
+                    node.input[i] = f"{tensor}_float"
+        for node in nodes:
+            if node.name == f"{tensor}_final":
+                node.output[0] = tensor
     out = onnx.ModelProto()
     out.CopyFrom(model)
     del out.graph.node[:]
@@ -278,7 +368,7 @@ def quantize(fp32_path: Path, out_path: Path, seed: int = 0, samples: int = 4) -
     consumed = {
         i
         for n in graph.node
-        if n.op_type == "Conv"
+        if n.op_type in ("Conv", "Gemm", "BatchNormalization")
         for i in n.input[1:]
         if n.input[0] in dq_of
     }

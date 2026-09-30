@@ -719,3 +719,135 @@ def test_activation_matmul_reference_is_a_per_head_int8_matmul():
         and desc[le.D_S] == tokens // 8
         and desc[le.D_EB] == 1
     )
+
+
+def test_channel_shuffle_and_unaligned_slice_become_channel_gather_jobs():
+    """12 channels (not a multiple of 8): shuffle = Reshape/Transpose/Reshape, then a 6/6 split by Slice."""
+    from onnx import parser
+
+    model = _name_nodes(
+        parser.parse_model(
+            """
+            <ir_version: 8, opset_import: ["" : 19]>
+            g (float[1, 12, 2, 2] input) => (float[1, 6, 2, 2] y_dq) <
+              float sc = {0.0625}, uint8 zp = {128},
+              int64[5] shp1 = {1, 2, 6, 2, 2}, int64[4] shp2 = {1, 12, 2, 2},
+              int64[1] s0 = {3}, int64[1] e0 = {9}, int64[1] ax = {1}
+            > {
+              xq = QuantizeLinear(input, sc, zp)
+              xd = DequantizeLinear(xq, sc, zp)
+              r1 = Reshape(xd, shp1)
+              t = Transpose<perm = [0, 2, 1, 3, 4]>(r1)
+              r2 = Reshape(t, shp2)
+              sq = QuantizeLinear(r2, sc, zp)
+              sd = DequantizeLinear(sq, sc, zp)
+              sl = Slice(sd, s0, e0, ax)
+              yq = QuantizeLinear(sl, sc, zp)
+              y_dq = DequantizeLinear(yq, sc, zp)
+            }
+            """
+        )
+    )
+    x = np.random.default_rng(3).uniform(-4, 4, (1, 12, 2, 2)).astype(np.float32)
+    compiled = _chain_matches_evaluator(model, x, 0.0625)
+    assert [job.kind for job in compiled.jobs] == ["cgather", "cgather"]
+
+
+def test_standalone_batchnorm_gemm_and_flatten_run_on_the_engine(tmp_path):
+    """BatchNorm -> depthwise 1x1 conv, Flatten -> copy, Gemm -> 1x1 conv: no float host operators are left."""
+    import onnx
+    import quantize_pow2_graph as q
+    from onnx import TensorProto, helper, numpy_helper
+
+    rng = np.random.default_rng(0)
+    init = [
+        numpy_helper.from_array(rng.uniform(0.5, 1.5, 16).astype(np.float32), "g"),
+        numpy_helper.from_array(rng.normal(0, 0.1, 16).astype(np.float32), "b"),
+        numpy_helper.from_array(rng.normal(0, 0.1, 16).astype(np.float32), "m"),
+        numpy_helper.from_array(rng.uniform(0.5, 1.5, 16).astype(np.float32), "v"),
+        numpy_helper.from_array(
+            rng.normal(0, 0.2, (16, 16, 1, 1)).astype(np.float32), "cw"
+        ),
+        numpy_helper.from_array(rng.normal(0, 0.1, (10, 16)).astype(np.float32), "fw"),
+        numpy_helper.from_array(rng.normal(0, 0.1, 10).astype(np.float32), "fb"),
+    ]
+    nodes = [
+        helper.make_node(
+            "BatchNormalization", ["input", "g", "b", "m", "v"], ["bn"], name="bn"
+        ),
+        helper.make_node("Relu", ["bn"], ["r"], name="r"),
+        helper.make_node("Conv", ["r", "cw"], ["c"], name="c", kernel_shape=[1, 1]),
+        helper.make_node("GlobalAveragePool", ["c"], ["p"], name="p"),
+        helper.make_node("Flatten", ["p"], ["f"], name="f"),
+        helper.make_node("Gemm", ["f", "fw", "fb"], ["output"], name="fc", transB=1),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "g",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 16, 4, 4])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 10])],
+        initializer=init,
+    )
+    path = tmp_path / "f.onnx"
+    onnx.save(
+        helper.make_model(
+            graph, opset_imports=[helper.make_opsetid("", 13)], ir_version=8
+        ),
+        str(path),
+    )
+    q.quantize(path, tmp_path / "q.onnx")
+    from layer_engine_graph import compile_graph
+
+    compiled = compile_graph(onnx.load(str(tmp_path / "q.onnx")), simplify=False)
+    assert [job.kind for job in compiled.jobs] == ["dw", "conv", "gap", "copy", "conv"]
+    host_ops = {n.op_type for n, _ in compiled.host_nodes} - {
+        "DequantizeLinear",
+        "QuantizeLinear",
+        "Constant",
+        "Identity",
+    }
+    assert not host_ops and compiled.levels == 1 and len(compiled.boundaries) == 1
+
+
+def test_onnx_to_engine_restores_the_relu_a_qdq_quantizer_folded_into_its_range():
+    from onnx import TensorProto, helper, numpy_helper
+    from onnx_to_engine import classify, strip_qdq
+
+    init = [
+        numpy_helper.from_array(np.float32(0.05), "s_in"),
+        numpy_helper.from_array(np.uint8(128), "z_in"),
+        numpy_helper.from_array(np.float32(0.03), "s_out"),
+        numpy_helper.from_array(np.uint8(0), "z_out"),
+        numpy_helper.from_array(np.full((4, 4, 1, 1), 7, dtype=np.int8), "wq"),
+        numpy_helper.from_array(np.float32(0.02), "s_w"),
+        numpy_helper.from_array(np.int8(0), "z_w"),
+    ]
+    nodes = [
+        helper.make_node("QuantizeLinear", ["input", "s_in", "z_in"], ["xq"]),
+        helper.make_node("DequantizeLinear", ["xq", "s_in", "z_in"], ["xd"]),
+        helper.make_node("DequantizeLinear", ["wq", "s_w", "z_w"], ["wd"]),
+        helper.make_node("Conv", ["xd", "wd"], ["c"], kernel_shape=[1, 1]),
+        helper.make_node("QuantizeLinear", ["c", "s_out", "z_out"], ["cq"]),
+        helper.make_node("DequantizeLinear", ["cq", "s_out", "z_out"], ["output"]),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "g",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 4, 2, 2])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4, 2, 2])],
+        initializer=init,
+    )
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 13)], ir_version=8
+    )
+    assert classify(model) == "qdq"  # scales are not powers of two
+    stripped = strip_qdq(model)
+    assert [n.op_type for n in stripped.graph.node] == [
+        "Conv",
+        "Relu",
+        "Identity",
+    ]  # zero point 0 = the folded Relu
+    w = numpy_helper.to_array(
+        next(i for i in stripped.graph.initializer if i.name == "wd")
+    )
+    np.testing.assert_allclose(w, 7 * 0.02, rtol=1e-6)

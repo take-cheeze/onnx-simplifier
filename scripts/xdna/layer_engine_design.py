@@ -59,7 +59,7 @@ def engine(
     segments = layer_engine_nets.segments_for(net, jobs, arch)
     kinds = {j.kind for j in jobs}
     scratch_blocks = max([j.in_layout.nbc for j in jobs if j.kind == "conv" and j.gather] + [1])  # gather scratch tiles = input blocks per region
-    absent = [m for m, kind in (("COPY", "copy"), ("UP", "up"), ("ADD", "add"), ("GAP", "gap"), ("BMUL", "bmul"), ("AMM", "amm"), ("AVG", "avgpool"), ("D2S", "d2s"), ("LUT", "lut"), ("DW", "dw")) if kind not in kinds]
+    absent = [m for m, kind in (("COPY", "copy"), ("UP", "up"), ("ADD", "add"), ("GAP", "gap"), ("BMUL", "bmul"), ("AMM", "amm"), ("CG", "cgather"), ("AVG", "avgpool"), ("D2S", "d2s"), ("LUT", "lut"), ("DW", "dw")) if kind not in kinds]
     resnet_like = net in ("full", "body", "bodyr", "l1proj", "l1id", "l2proj", "l3id", "l4id")  # no table/movement/depthwise code: 16 KB program memory
     generic = net.startswith(
         ("onnx:", "gen:")
@@ -69,6 +69,8 @@ def engine(
         net == "full"
     )  # jobs[:5] are the stem GEMM chunks + pool; the rest is the looped body
     nch = [n_chunks(j, slot - 192) for j in jobs]
+    # partial sums only live between the chunks of one job: one 64-word tile per (output block, 8 pixels) of the widest such job
+    acc_tiles = max([j.out_layout.nbc * -(-j.out_layout.w * j.out_layout.h // 8) for j, n in zip(jobs, nch) if n > 1] + [1])
     slots_used = layer_engine.arena_slots(jobs)
     has_res = generic or any(j.res_slot is not None for j in jobs)
 
@@ -81,7 +83,7 @@ def engine(
         source_file=str(_KERNEL),
         arg_types=[act_ty, w_ty, out_ty, act_ty],
         compile_flags=[f"-DENG_REGION_BYTES={REGION_BYTES}"]
-        + (["-DENG_NO_G4"] + [f"-DENG_NO_{m}" for m in absent] + (["-DENG_ACC_TILES=1"] if all(n == 1 for n in nch) else []) + [f"-DENG_SCRATCH_BLOCKS={max(scratch_blocks, 1)}"] if generic else (["-DENG_NO_MOVE", "-DENG_NO_LUT", "-DENG_NO_DW"] if resnet_like else []))
+        + (["-DENG_NO_G4"] + [f"-DENG_NO_{m}" for m in absent] + [f"-DENG_ACC_TILES={acc_tiles}"] + [f"-DENG_SCRATCH_BLOCKS={max(scratch_blocks, 1)}"] if generic else (["-DENG_NO_MOVE", "-DENG_NO_LUT", "-DENG_NO_DW"] if resnet_like else []))
         + kflags.split(),
     )
 

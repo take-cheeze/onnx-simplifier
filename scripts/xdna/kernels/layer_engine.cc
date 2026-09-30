@@ -364,6 +364,27 @@ extern "C" void layer_chunk(const int8_t *act, const uint8_t *slot, int8_t *out,
     return;
   }
 #endif  // ENG_NO_D2S
+#ifndef ENG_NO_CG
+  if (L.mode == 14) {
+    // Channel gather (unaligned Slice / Concat / channel shuffle): out[p][ol*8 + c] = src[p][channel of table entry]. Entry
+    // (int32): -1 = zero (byte 128), else (which << 24) | byte offset of the source channel's first pixel inside the
+    // act (which = 0) or resid (1) object; the pixel stride of every block is 8 bytes.
+    const int P = L.w * L.h;
+    const int32_t *tab = (const int32_t *)L.weights;
+    for (int ol = 0; ol < L.nb; ++ol)
+      for (int c = 0; c < 8; ++c) {
+        const int32_t e = tab[ol * 8 + c];
+        uint8_t *dst = (uint8_t *)out + ol * P * 8 + c;
+        if (e < 0) {
+          for (int p = 0; p < P; ++p) dst[p * 8] = 128;
+        } else {
+          const uint8_t *src = ((e >> 24) ? (const uint8_t *)resid : (const uint8_t *)act) + (e & 0xFFFFFF);
+          for (int p = 0; p < P; ++p) dst[p * 8] = src[p * 8];
+        }
+      }
+    return;
+  }
+#endif  // ENG_NO_CG
 #ifndef ENG_NO_AMM
   if (L.mode == 15) {
     // Activation x activation matmul (attention), per head, both operands in the usual block layout:

@@ -110,7 +110,7 @@ class Job:
     res_mode: int = 0  # 1 int8 residual, 2 uint8 residual
     ea: int = 0
     eb: int = 0
-    kind: str = "conv"  # "conv" | "pool" | "dw" (depthwise 3x3) | "lut" (unary table) | "copy" | "up" | "maxpool" | "add" | "gap" | "bmul" | "avgpool" | "d2s" | "amm"
+    kind: str = "conv"  # "conv" | "pool" | "dw" (depthwise 3x3) | "lut" (unary table) | "copy" | "up" | "maxpool" | "add" | "gap" | "bmul" | "avgpool" | "d2s" | "amm" | "cgather"
     copy_spec: list | None = (
         None  # "copy": per output block (source 0/1, source block, scale exponent)
     )
@@ -123,6 +123,7 @@ class Job:
     factor: int = (
         1  # "up": nearest upsample factor; "maxpool": window; stride is `stride`
     )
+    chan_spec: list | None = None  # "cgather": per output channel (which source, source channel) or (0, -1) for zero
     heads: int = 1  # "amm": attention heads (channels of every operand / output are head-major)
     amm_t: bool = False  # "amm": B is used transposed (scores = K^T Q); else natural (context = V P)
     ceil_pool: bool = False  # "maxpool": ONNX ceil_mode (partial windows on the right/bottom edge are kept)
@@ -139,6 +140,10 @@ class Job:
     taps: list[int] = field(init=False)
 
     def __post_init__(self):
+        if self.kind in ("conv", "dw") and self.weight.shape[0] % TILE:  # channel counts that are not a multiple of 8: zero rows
+            extra = -self.weight.shape[0] % TILE
+            self.weight = np.concatenate([self.weight, np.zeros((extra, *self.weight.shape[1:]), dtype=self.weight.dtype)])
+            self.bias = np.concatenate([self.bias, np.zeros(extra, dtype=self.bias.dtype)])
         oc, _, kh, _ = self.weight.shape
         s = self.stride
         pad = kh // 2 if self.pad is None else self.pad
@@ -146,7 +151,7 @@ class Job:
         oh = (self.in_layout.h + 2 * pad - kh) // s + 1
         if self.kind == "pool":
             ow, oh = self.in_layout.w // 2, self.in_layout.h // 2
-        if self.kind in ("lut", "copy", "add", "bmul", "amm"):
+        if self.kind in ("lut", "copy", "add", "bmul", "amm", "cgather"):
             ow, oh = self.in_layout.w, self.in_layout.h
         if self.kind == "gap":
             ow, oh = 1, 1
@@ -172,7 +177,7 @@ class Job:
             raise ValueError(
                 f"{self.name}: depthwise/table jobs need the same channel blocking in and out"
             )
-        if self.kind in ("lut", "copy", "up", "maxpool", "add", "gap", "bmul", "avgpool", "d2s", "amm"):
+        if self.kind in ("lut", "copy", "up", "maxpool", "add", "gap", "bmul", "avgpool", "d2s", "amm", "cgather"):
             self.taps = [0]
         elif kh == 3:
             self.taps = valid_taps(self.in_layout.h, self.in_layout.w, oh, ow, s)
@@ -225,7 +230,7 @@ def plan_chunks(job: Job, payload: int) -> int:
 
 
 def n_chunks(job: Job, payload: int) -> int:
-    if job.kind in ("pool", "dw", "lut", "copy", "up", "maxpool", "add", "gap", "bmul", "avgpool", "d2s", "amm"):
+    if job.kind in ("pool", "dw", "lut", "copy", "up", "maxpool", "add", "gap", "bmul", "avgpool", "d2s", "amm", "cgather"):
         return 1
     steps = len(job.taps) * job.in_layout.ncp
     return math.ceil(steps / plan_chunks(job, payload))
@@ -235,7 +240,7 @@ def pack_job(job: Job, slot_bytes: int) -> np.ndarray:
     """Weight stream of one job: uint8 [column][chunk][row][slot_bytes]."""
     payload = slot_bytes - DESC_BYTES
     lay_in, lay_out = job.in_layout, job.out_layout
-    if job.kind in ("dw", "lut", "copy", "up", "maxpool", "add", "gap", "bmul", "avgpool", "d2s", "amm"):
+    if job.kind in ("dw", "lut", "copy", "up", "maxpool", "add", "gap", "bmul", "avgpool", "d2s", "amm", "cgather"):
         out = np.zeros((COLS, 1, ROWS, slot_bytes), dtype=np.uint8)
         for core in range(CORES):
             col, row = divmod(core, ROWS)
@@ -280,6 +285,21 @@ def pack_job(job: Job, slot_bytes: int) -> np.ndarray:
                 desc[D_NBP], desc[D_NCP], desc[D_TT0] = lay_in.nbc, job.b_layout.nbc, job.b_layout.region_bytes
                 desc[D_EA], desc[D_EB], desc[D_TTN] = (kb if job.amm_t else obh), int(job.amm_t), lay_out.nbc
                 slot[:DESC_BYTES] = desc.view(np.uint8)
+                continue
+            if job.kind == "cgather":
+                desc[D_MODE] = 14
+                slot[:DESC_BYTES] = desc.view(np.uint8)
+                tab = np.full((len(blocks), 8), -1, dtype=np.int32)
+                for ol, g in enumerate(blocks):
+                    for c in range(8):
+                        which, ch = job.chan_spec[g * 8 + c]
+                        if ch < 0:
+                            continue
+                        src_layout = job.b_layout if which else lay_in
+                        cp, local = divmod(ch // 8, src_layout.nbc)
+                        tab[ol, c] = (which << 24) | (cp * src_layout.region_bytes + local * src_layout.pixels * TILE + ch % 8)
+                if blocks:
+                    slot[DESC_BYTES : DESC_BYTES + tab.nbytes] = tab.view(np.uint8).reshape(-1)
                 continue
             if job.kind in ("gap", "bmul"):
                 desc[D_MODE] = 10 if job.kind == "gap" else 11
@@ -474,6 +494,12 @@ def reference(job: Job, act: np.ndarray, resid: np.ndarray | None) -> np.ndarray
             ky, kx = divmod(tap, f)
             out[ky::f, kx::f] = fmap[:, :, tap * nb_out * TILE : (tap + 1) * nb_out * TILE]
         return out.reshape(-1, nb_out * TILE)
+    if job.kind == "cgather":
+        out = np.full((act.shape[0], len(job.chan_spec)), 128, dtype=np.uint8)
+        for c, (which, ch) in enumerate(job.chan_spec):
+            if ch >= 0:
+                out[:, c] = (resid if which else act)[:, ch]
+        return out
     if job.kind == "amm":
         a = act.astype(np.int64) - 128
         b = resid.astype(np.int64) - 128
