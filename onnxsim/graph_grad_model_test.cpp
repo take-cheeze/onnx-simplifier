@@ -91,15 +91,19 @@ const onnx::TensorProto* Initializer(const onnx::ModelProto& m,
 }
 
 // The values of a constant, whether it holds typed data or raw bytes.
+// raw_data is little-endian whatever the host is (ONNX's rule), so decode it
+// byte by byte rather than memcpy'ing host-order words (s390x is big-endian).
 std::vector<int64_t> Int64Values(const onnx::TensorProto& t) {
   if (t.int64_data_size() > 0)
     return {t.int64_data().begin(), t.int64_data().end()};
   std::vector<int64_t> values;
   const std::string& raw = t.raw_data();
-  for (size_t i = 0; i + sizeof(int64_t) <= raw.size(); i += sizeof(int64_t)) {
-    int64_t v;
-    std::memcpy(&v, raw.data() + i, sizeof v);
-    values.push_back(v);
+  for (size_t i = 0; i + 8 <= raw.size(); i += 8) {
+    uint64_t bits = 0;
+    for (int k = 7; k >= 0; --k) {
+      bits = (bits << 8) | static_cast<unsigned char>(raw[i + k]);
+    }
+    values.push_back(static_cast<int64_t>(bits));
   }
   return values;
 }
@@ -109,9 +113,13 @@ std::vector<float> FloatValues(const onnx::TensorProto& t) {
     return {t.float_data().begin(), t.float_data().end()};
   std::vector<float> values;
   const std::string& raw = t.raw_data();
-  for (size_t i = 0; i + sizeof(float) <= raw.size(); i += sizeof(float)) {
+  for (size_t i = 0; i + 4 <= raw.size(); i += 4) {
+    uint32_t bits = 0;
+    for (int k = 3; k >= 0; --k) {
+      bits = (bits << 8) | static_cast<unsigned char>(raw[i + k]);
+    }
     float v;
-    std::memcpy(&v, raw.data() + i, sizeof v);
+    std::memcpy(&v, &bits, sizeof v);
     values.push_back(v);
   }
   return values;
