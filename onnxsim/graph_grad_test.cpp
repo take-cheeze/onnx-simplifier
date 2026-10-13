@@ -201,21 +201,19 @@ Shapes AttentionishShapes() {
           {"R", {2, 4}}, {"S", {2, 4}}, {"Y", {2, 4}}};
 }
 
-// The GELU-shaped transcendentals, ending in a rank change.
 // The ReduceMax/ReduceMin rule and the LogSoftmax/Cast rules, each on its own
-// slice so the allowlist sweep sees everything they emit.
+// slice so the allowlist sweep sees everything they emit. The sweep seeds Y,
+// so each slice must end in Y.
 std::vector<onnx::NodeProto> ExtremumSlice() {
   return {
-      Node("ReduceMax", {"A"}, {"M"},
-           {IntsAttr("axes", {1}), IntAttr("keepdims", 0)}),
       Node("ReduceMin", {"A"}, {"N"},
            {IntsAttr("axes", {0}), IntAttr("keepdims", 1)}),
+      Node("ReduceMax", {"N"}, {"Y"},
+           {IntsAttr("axes", {0}), IntAttr("keepdims", 0)}),
   };
 }
 
-Shapes ExtremumShapes() {
-  return {{"A", {2, 3}}, {"M", {2}}, {"N", {1, 3}}, {"Y", {2}}};
-}
+Shapes ExtremumShapes() { return {{"A", {2, 3}}, {"N", {1, 3}}, {"Y", {3}}}; }
 
 std::vector<onnx::NodeProto> LogSoftmaxCastSlice() {
   return {
@@ -228,6 +226,7 @@ Shapes LogSoftmaxCastShapes() {
   return {{"A", {2, 3}}, {"L", {2, 3}}, {"Y", {2, 3}}};
 }
 
+// The GELU-shaped transcendentals, ending in a rank change.
 std::vector<onnx::NodeProto> TranscendentalSlice() {
   return {
       Node("Erf", {"A"}, {"E"}),
