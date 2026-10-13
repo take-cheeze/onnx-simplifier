@@ -2566,6 +2566,8 @@ def _analytic(model, feeds, seed, target, seed_type=onnx.TensorProto.FLOAT):
     ``target``, run through onnxruntime. ``seed`` is the incoming gradient
     of the output, fed as-is."""
     backward = _backward_model(model, [target], seed_type=seed_type)
+
+
 # The structural rules (Slice, Concat, Pad, Expand, Squeeze, Unsqueeze) are
 # checked against finite differences above, and against hand-derived values
 # here. Finite differences show the gradient is the derivative; the exact
@@ -2769,6 +2771,8 @@ def test_a_cast_this_rule_cannot_invert_is_refused(to, type_name):
         graph_grad.build_backward(
             b, list(forward.graph.node), _static_shapes(forward), {"Y": "dY"}, ["A"]
         )
+
+
 def test_a_strided_slice_scatters_the_seed_to_the_strided_positions():
     # X[7] sliced [1:7:2] keeps positions 1, 3, 5. The seed [10, 20, 30] must
     # land exactly there, with zeros elsewhere -- not merely have the right
